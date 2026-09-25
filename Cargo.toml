@@ -1,0 +1,31 @@
+[package]
+name = "cargo-atlas"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A compiler-accurate map of a Rust workspace for AI coding assistants"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TheBlitzschnell/cargo-atlas"
+readme = "README.md"
+keywords = ["rust-analyzer", "code-graph", "claude", "cargo", "scip"]
+categories = ["development-tools", "command-line-utilities"]
+# The fixture has its own Cargo.toml, so Cargo leaves it out of the package
+# anyway; leave out the tests that need it too.
+exclude = ["tests/", ".github/"]
+
+[dependencies]
+# Error handling with context messages ("while running rust-analyzer: ...").
+anyhow = "1"
+# Command-line parsing.
+clap = { version = "4", features = ["derive"] }
+# Line numbers for syntax items (syn spans need this feature outside proc macros).
+proc-macro2 = { version = "1", features = ["span-locations"] }
+# The scip crate pins this exact protobuf version; we decode the index with it.
+protobuf = "=3.7.2"
+# Sourcegraph's types for rust-analyzer's index format (SCIP).
+scip = "0.10"
+# Reading `cargo metadata` and writing graph.json.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Parsing Rust source for facts the index leaves out (impl headers, derives).
+syn = { version = "2", features = ["full", "visit"] }

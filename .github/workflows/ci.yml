@@ -1,0 +1,24 @@
+# Format, lint and test on every push and pull request.
+# rustup reads rust-toolchain.toml, so the first cargo command installs
+# Rust 1.95.0 with rustfmt, clippy, rust-analyzer and rust-src.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show the toolchain
+        run: |
+          rustc --version
+          rust-analyzer --version
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
