@@ -12,6 +12,8 @@
 //!    function or type whose span contains it. That gives `calls`,
 //!    `references`, `may_call` and `uses_type` edges, with no name matching.
 //! 5. Derives.
+//! 6. Tests and unsafe code: syn finds them, and each is attached to its
+//!    item the same way impl headers are.
 //!
 //! rust-analyzer usually gives each item its own symbol, but not always. `main` in `build.rs` and `main` in
 //! `src/main.rs` share one symbol, and so do two structs with the same name
@@ -27,7 +29,9 @@ use scip::types::symbol_information::Kind;
 use scip::types::{Document, Index, PositionEncoding, SymbolRole};
 
 use crate::cargo_meta::Workspace;
-use crate::model::{Confidence, EdgeKind, Graph, GraphBuilder, Node, NodeKind, edge};
+use crate::model::{
+    Confidence, EdgeKind, Graph, GraphBuilder, Node, NodeKind, UnsafeKind, UnsafeSite, edge,
+};
 use crate::symbols::{self, ParsedSymbol, Shape};
 use crate::syntax::{self, FileFacts, NameAt};
 
@@ -248,6 +252,8 @@ pub fn build_graph(index: &Index, workspace: &Workspace, produced_by: String) ->
         add_reference_edges(&mut graph, &ctx, doc, file_containers, &trait_method_impls);
     }
     add_derive_edges(&mut graph, &ctx, &facts, &by_line);
+    mark_tests(&mut graph, &ctx, &facts, &by_line);
+    graph.unsafe_sites = find_unsafe_owners(&graph, &ctx, &facts, &by_line);
 
     graph.finish(produced_by)
 }
@@ -326,6 +332,7 @@ fn crate_node(name: &str) -> Node {
         file: None,
         line: None,
         signature: None,
+        test: false,
     }
 }
 
@@ -402,6 +409,7 @@ fn add_item_nodes(graph: &mut GraphBuilder, ctx: &mut Context) {
                 file: Some(def.file.clone()),
                 line: Some(def.line),
                 signature: (!signature.is_empty()).then(|| signature.to_string()),
+                test: false,
             });
             ctx.items.push(Item {
                 symbol: symbol.clone(),
@@ -500,6 +508,7 @@ fn named_node(id: &str, name: &str, kind: NodeKind) -> Node {
         file: None,
         line: None,
         signature: None,
+        test: false,
     }
 }
 
@@ -797,6 +806,106 @@ fn add_derive_edges(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Step 6: tests and unsafe code
+// ---------------------------------------------------------------------------
+
+fn mark_tests(
+    graph: &mut GraphBuilder,
+    ctx: &Context,
+    facts: &HashMap<String, FileFacts>,
+    by_line: &HashMap<&str, SymbolsByLine>,
+) {
+    for doc in &ctx.index.documents {
+        let file = doc.relative_path.as_str();
+        let Some(file_facts) = facts.get(file) else {
+            continue;
+        };
+        for test in &file_facts.tests {
+            let found = resolve_name_on_line(
+                graph,
+                ctx,
+                by_line.get(file),
+                file,
+                test,
+                NodeKind::is_callable,
+            );
+            if let Some(node) = found.and_then(|id| graph.node_mut(&id)) {
+                node.test = true;
+            }
+        }
+    }
+}
+
+/// Every unsafe site, with the node it belongs to:
+///
+/// - a block: the innermost function (or const or static) around it;
+/// - an `unsafe fn` or trait: itself;
+/// - an `unsafe impl`: its self type, so `RawBuf` lists `unsafe impl Send for RawBuf`.
+fn find_unsafe_owners(
+    graph: &GraphBuilder,
+    ctx: &Context,
+    facts: &HashMap<String, FileFacts>,
+    by_line: &HashMap<&str, SymbolsByLine>,
+) -> Vec<UnsafeSite> {
+    // Items that can hold an `unsafe` block, with their spans, by file.
+    let mut holders: HashMap<&str, Vec<(Span, &str)>> = HashMap::new();
+    for item in &ctx.items {
+        let can_hold_code = graph.node(&item.def.node_id).is_some_and(|n| {
+            n.kind.is_callable() || matches!(n.kind, NodeKind::Const | NodeKind::Static)
+        });
+        if let (true, Some(span)) = (can_hold_code, item.def.span) {
+            holders
+                .entry(item.def.file.as_str())
+                .or_default()
+                .push((span, item.def.node_id.as_str()));
+        }
+    }
+
+    let mut sites = Vec::new();
+    for doc in &ctx.index.documents {
+        let file = doc.relative_path.as_str();
+        let Some(file_facts) = facts.get(file) else {
+            continue;
+        };
+        let on_line = by_line.get(file);
+        for code in &file_facts.unsafe_code {
+            let named = |want: fn(NodeKind) -> bool| {
+                let at = code.name.as_ref()?;
+                resolve_name_on_line(graph, ctx, on_line, file, at, want)
+            };
+            let item = match code.kind {
+                UnsafeKind::Block => {
+                    // syn counts columns in characters and the index may count
+                    // bytes or UTF-16 units; they agree on ASCII lines, and the
+                    // column only matters when two items share a line.
+                    let position = (code.line - 1, code.column);
+                    holders
+                        .get(file)
+                        .into_iter()
+                        .flatten()
+                        .filter(|(span, _)| span.contains(position))
+                        .max_by_key(|(span, _)| span.start)
+                        .map(|(_, id)| id.to_string())
+                }
+                UnsafeKind::Fn => named(NodeKind::is_callable),
+                UnsafeKind::Trait => named(|k| k == NodeKind::Trait),
+                UnsafeKind::Impl => named(NodeKind::is_type_like),
+            };
+            sites.push(UnsafeSite {
+                file: file.to_string(),
+                line: code.line,
+                kind: code.kind,
+                item,
+                trait_name: code.trait_name.clone(),
+                documented: code.documented,
+                in_trait_impl: code.in_trait_impl,
+            });
+        }
+    }
+    sites
 }
 
 #[cfg(test)]

@@ -2,27 +2,29 @@
 //!
 //! `cargo atlas build` asks rust-analyzer to resolve every name in the
 //! workspace, turns the result into a graph, and saves it as
-//! `.atlas/graph.json`. The other commands answer questions from that file.
+//! `.atlas/graph.json`. The other commands answer questions from that file,
+//! and `cargo atlas serve` answers the same questions as MCP tools.
 
 mod builder;
 mod cargo_meta;
+mod freshness;
 mod model;
+mod pipeline;
 mod query;
 mod report;
 mod rust_analyzer;
+mod server;
 mod symbols;
 mod syntax;
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
-use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::cargo_meta::Workspace;
-use crate::model::EdgeKind;
+use crate::model::Features;
 use crate::query::Atlas;
 
 #[derive(Parser)]
@@ -37,7 +39,7 @@ use crate::query::Atlas;
 struct Cli {
     /// The workspace to use.
     #[arg(long, global = true, default_value = ".")]
-    dir: PathBuf,
+    dir: std::path::PathBuf,
 
     #[command(subcommand)]
     command: Command,
@@ -46,7 +48,52 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Index the workspace with rust-analyzer and write .atlas/graph.json.
-    Build,
+    Build {
+        #[command(flatten)]
+        features: FeatureArgs,
+    },
+    // The questions, answered from .atlas/graph.json.
+    #[command(flatten)]
+    Query(Query),
+    /// Answer the same questions as MCP tools, for AI assistants.
+    ///
+    /// Speaks MCP on stdin and stdout, answering from .atlas/graph.json and
+    /// rebuilding it when files change. To use it from Claude Code:
+    ///
+    ///     claude mcp add --transport stdio cargo-atlas -- cargo-atlas serve
+    ///
+    /// Rebuilds keep the features of the graph they replace, unless
+    /// --features or --all-features is given here.
+    Serve {
+        #[command(flatten)]
+        features: FeatureArgs,
+    },
+}
+
+/// Which Cargo features rust-analyzer turns on. Without either flag, each
+/// package's default features, as with a plain `cargo build`.
+#[derive(clap::Args)]
+struct FeatureArgs {
+    /// Turn on every Cargo feature, like `cargo build --all-features`.
+    #[arg(long, conflicts_with = "features")]
+    all_features: bool,
+    /// Turn on these Cargo features as well as the default ones (comma-separated).
+    #[arg(long, value_delimiter = ',', value_name = "FEATURES")]
+    features: Vec<String>,
+}
+
+impl FeatureArgs {
+    /// `None` when neither flag was given.
+    fn chosen(&self) -> Option<Features> {
+        (self.all_features || !self.features.is_empty()).then(|| Features {
+            all: self.all_features,
+            listed: self.features.clone(),
+        })
+    }
+}
+
+#[derive(Subcommand)]
+enum Query {
     /// Who calls a function or method.
     Callers { item: String },
     /// What a function or method calls.
@@ -57,6 +104,26 @@ enum Command {
     Path { from: String, to: String },
     /// Everything about one item: kind, location, signature, links.
     Explain { item: String },
+    /// Items whose name or path contains TEXT.
+    Search {
+        text: String,
+        /// Only one kind of item: function, method, struct, trait, ...
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// The tests that reach a function, and the command that runs them.
+    Tests { item: String },
+    /// Unsafe code, and whether each piece has its SAFETY comment.
+    ///
+    /// With an ITEM, only the unsafe code inside it, and for a function also
+    /// the unsafe code its calls reach.
+    Unsafe {
+        /// A crate, module, type or function.
+        item: Option<String>,
+        /// Only the sites without their SAFETY comment or # Safety section.
+        #[arg(long)]
+        missing: bool,
+    },
     /// Write .atlas/report.md and print it.
     Report,
 }
@@ -82,66 +149,58 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<String> {
     if !cli.dir.is_dir() {
-        anyhow::bail!("no such directory: {}", cli.dir.display());
+        bail!("no such directory: {}", cli.dir.display());
     }
-    let workspace = cargo_meta::load(&cli.dir)?;
-    let atlas_dir = workspace.root.join(".atlas");
-    let graph_path = atlas_dir.join("graph.json");
-    let atlas = || Atlas::load(&graph_path);
-
     match cli.command {
-        Command::Build => build(&workspace, &atlas_dir),
-        Command::Callers { item } => atlas()?.callers(&item),
-        Command::Callees { item } => atlas()?.callees(&item),
-        Command::Impls { item } => atlas()?.impls(&item),
-        Command::Path { from, to } => atlas()?.path(&from, &to),
-        Command::Explain { item } => atlas()?.explain(&item),
-        Command::Report => {
-            let text = report::markdown(atlas()?.graph());
-            std::fs::write(atlas_dir.join("report.md"), &text).context("writing report.md")?;
-            Ok(text)
+        Command::Build { features } => build(&cli.dir, &features.chosen().unwrap_or_default()),
+        Command::Query(query) => answer(&cli.dir, query),
+        Command::Serve { features } => {
+            server::run(&cli.dir, features.chosen())?;
+            Ok(String::new())
         }
     }
 }
 
-fn build(workspace: &Workspace, atlas_dir: &Path) -> Result<String> {
-    let started = Instant::now();
-    let ra_version = rust_analyzer::version()?;
-    std::fs::create_dir_all(atlas_dir).context("creating .atlas")?;
-    // A `*` .gitignore inside keeps the whole folder out of git without touching the repo's own.
-    std::fs::write(atlas_dir.join(".gitignore"), "*\n").context("writing .atlas/.gitignore")?;
+fn build(dir: &Path, features: &Features) -> Result<String> {
+    let workspace = cargo_meta::load(dir)?;
+    eprintln!(
+        "Indexing {} with {}, {} ...",
+        workspace.root.display(),
+        rust_analyzer::version()?,
+        features.describe()
+    );
+    let built = pipeline::run(&workspace, features)?;
+    for warning in &built.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(format!("{}\n", built.summary()))
+}
 
-    let std_sources = rust_analyzer::std_sources_available(&workspace.root);
-    if !std_sources {
+fn answer(dir: &Path, query: Query) -> Result<String> {
+    let workspace = cargo_meta::load(dir)?;
+    let atlas = Atlas::load(&pipeline::graph_path(&workspace))?;
+    // The answer comes from the last build; say so if the code moved on since.
+    let changed = freshness::changed(&workspace.root, &atlas.graph().files);
+    if !changed.is_empty() {
         eprintln!(
-            "warning: the standard library's source is missing, so calls inside std macros \
-             such as println! will be missing. Fix: rustup component add rust-src"
+            "note: {} since the last build. Run `cargo atlas build` to update the graph.",
+            freshness::describe(&changed)
         );
     }
-
-    eprintln!(
-        "Indexing {} with {ra_version} ...",
-        workspace.root.display()
-    );
-    let index_path = atlas_dir.join("index.scip");
-    rust_analyzer::write_index(&workspace.root, &index_path)?;
-    let index = rust_analyzer::read_index(&index_path)?;
-
-    let produced_by = format!("cargo-atlas {}; {ra_version}", env!("CARGO_PKG_VERSION"));
-    let mut graph = builder::build_graph(&index, workspace, produced_by);
-    graph.stats.std_sources_found = std_sources;
-    let json = serde_json::to_string_pretty(&graph).context("serializing the graph")?;
-    std::fs::write(atlas_dir.join("graph.json"), json).context("writing graph.json")?;
-
-    let calls = graph
-        .edges
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Calls)
-        .count();
-    Ok(format!(
-        "Wrote .atlas/graph.json: {} items, {} links ({calls} calls) in {:.1}s\n",
-        graph.nodes.len(),
-        graph.edges.len(),
-        started.elapsed().as_secs_f64()
-    ))
+    match query {
+        Query::Callers { item } => atlas.callers(&item),
+        Query::Callees { item } => atlas.callees(&item),
+        Query::Impls { item } => atlas.impls(&item),
+        Query::Path { from, to } => atlas.path(&from, &to),
+        Query::Explain { item } => atlas.explain(&item),
+        Query::Search { text, kind } => atlas.search(&text, kind.as_deref()),
+        Query::Tests { item } => atlas.tests(&item),
+        Query::Unsafe { item, missing } => atlas.unsafe_code(item.as_deref(), missing),
+        Query::Report => {
+            let text = report::markdown(atlas.graph());
+            let path = workspace.root.join(".atlas").join("report.md");
+            std::fs::write(path, &text).context("writing report.md")?;
+            Ok(text)
+        }
+    }
 }

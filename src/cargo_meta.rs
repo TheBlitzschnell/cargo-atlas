@@ -1,7 +1,7 @@
 //! Reading the workspace layout from `cargo metadata`.
 //!
 //! We only need a little of Cargo's output: which packages the workspace has,
-//! and which crates each one depends on.
+//! where their manifests are, and which crates each one depends on.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,21 +10,23 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// The parts of a workspace the graph uses.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Workspace {
     pub root: PathBuf,
     pub packages: Vec<Package>,
 }
 
 /// One package (crate) in the workspace.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Package {
     pub name: String,
+    /// Absolute path of the package's `Cargo.toml`.
+    pub manifest_path: PathBuf,
     pub dependencies: Vec<Dependency>,
 }
 
 /// One entry from a package's `[dependencies]`, `[dev-dependencies]` or `[build-dependencies]`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Dependency {
     pub name: String,
     /// `None` for normal dependencies, `Some("dev")` or `Some("build")` otherwise.

@@ -3,6 +3,38 @@
 One entry per decision: the date, what was decided, why, and what was rejected.
 Newest first.
 
+## 2026-09-26: Compare against Claude Code's LSP tool next
+- Asked on LinkedIn: Claude Code's LSP tool already gets callers and trait impls from rust-analyzer, so what does this add? Its answers need a file and a position for each question and come one symbol at a time; cargo-atlas answers by name, across the workspace, with every call site, plus tests and unsafe code. Whether that saves an assistant any work is unmeasured.
+- Plan: 10 questions about ripgrep, each answered by Claude Code with the LSP tool alone and with cargo-atlas alone. Count tool calls, tokens and wrong answers.
+
+## 2026-09-26: Queries accept the names people write
+- `GlobBuilder::build` finds `GlobBuilder<'a>::build`, and `Square::area` finds `<Square as Area>::area`. Found while checking ripgrep: the exact form failed with "nothing named".
+- A path through a re-export (`tokio::task::spawn_blocking`, defined in `task/blocking.rs`) lists the items with that last name instead of failing.
+- Exact matches still come first, so the full form always picks one item.
+
+## 2026-09-26: rust-analyzer runs with `cfg(miri)` off, and features are a choice
+- Bug found on tokio: rust-analyzer's `cargo.cfgs` setting defaults to `["debug_assertions", "miri"]`, so every `#[cfg(not(miri))]` item was missing, including 40 of tokio's 153 test files. cargo-atlas now passes a config with `debug_assertions` only. tokio went from 11,196 call links to 12,512.
+- `--features` and `--all-features` on `build` and `serve`. The graph records its features; a server rebuild keeps them unless `serve` was given its own.
+- Also fixed: a relative `RUST_SRC_PATH` was accepted by our check but ignored by rust-analyzer, which silently dropped 18% of ripgrep's call links. It is now made absolute before rust-analyzer sees it.
+
+## 2026-09-26: Tests and unsafe code, from the syn pass
+- Tests: functions whose attribute's last segment is `test` or ends in `_test`, or is `rstest`, `test_case` or `quickcheck`. `#[cfg(test)]` alone doesn't make a test. `tests ITEM` walks `calls`, `may_call` and `references` links backwards and prints a `cargo test` command with each test's full path as the filter: precise, never runs an unrelated test.
+- Unsafe: blocks, fns, impls and traits. "Documented" follows clippy's convention: a comment with `SAFETY:` above a block or impl (blank lines and attributes between are fine, and so is a comment above the whole statement), a `# Safety` section in an unsafe fn's or trait's docs. Also accepted, after checking tokio: a `# Safety` heading in a comment, a `Safety:` line in the docs, and an `unsafe fn` in a trait impl, whose contract is on the trait.
+- Macro calls whose contents parse as Rust are walked, which found 78 more sites in tokio's `cfg_*! { ... }` blocks. `macro_rules!` bodies and `quote!` are skipped: templates, not code.
+- Rejected: judging whether prose explains soundness. A comment without the marker counts as missing; the output says which rule it applies.
+
+## 2026-09-26: The graph notices edits; rebuilds run in the background
+- Each build stamps every file it read (size, modification time, FNV-1a hash of the content) plus the Cargo manifests. A check stats every file and hashes only those whose size or time moved: 2 to 4 ms per answer on tokio.
+- The server checks before every answer. Changed files are named in a note at the top of the answer, and a rebuild starts in the background; `refresh` waits for one. After a failed rebuild, automatic rebuilds stop until `refresh` succeeds, so a broken setup doesn't rebuild on every call.
+- A file saved while rust-analyzer runs gets an empty hash, so it counts as changed and the next check rebuilds.
+- Rejected: a file watcher. More code, platform differences, and it would rebuild while nobody asks anything. Rejected: rebuilding before every answer, which costs 10 to 40 seconds each time.
+
+## 2026-09-26: MCP server on rmcp, the official Rust SDK
+- `cargo atlas serve` exposes callers, callees, impls, path, explain, search, tests, unsafe_code and refresh. Each returns the command line's text. A list of matches for an ambiguous name is an ordinary answer, not an error, since picking one is the next step.
+- rmcp handles protocol versions: the handshake with a 2025-06-18 client works, and the current spec is 2026-07-28. With tokio it takes the build from 33 crates to 76. Rejected: hand-written JSON-RPC over stdio, about 200 lines, but every protocol change would be ours to track.
+- Async stays in `src/server.rs`; builds run on tokio's blocking pool. Nothing starts before the first call, because an assistant may start the server in every project.
+- Answers are cut at 24,000 characters, under Claude Code's 10,000-token warning.
+
 ## 2026-09-25: Items that share a symbol each get their own node (bug fix)
 - Bug: rust-analyzer gives one symbol to `main` in `build.rs` and `main` in `src/main.rs`, to every example's `main`, and to same-named items declared inside different functions (rust-analyzer issue #18771). The first definition won and the rest vanished with their calls: ripgrep's real `main` was missing, and mini-redis kept 1 of its 6 `main`s.
 - Fix: every definition becomes a node; a shared symbol gets ids like `symbol @file:line`. A reference picks the definition in its own file; when that is still a guess, the link is CANDIDATE, not EXACT.

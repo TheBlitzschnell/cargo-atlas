@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// Bump this when the shape of `graph.json` changes.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// What kind of Rust item a node stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -34,6 +34,24 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
+    pub const ALL: [NodeKind; 15] = [
+        Self::Crate,
+        Self::Module,
+        Self::Struct,
+        Self::Enum,
+        Self::Union,
+        Self::Trait,
+        Self::TypeAlias,
+        Self::Function,
+        Self::Method,
+        Self::TraitMethod,
+        Self::Const,
+        Self::Static,
+        Self::Macro,
+        Self::Derive,
+        Self::ExternalTrait,
+    ];
+
     /// Functions, methods and trait methods: things that can be called.
     pub fn is_callable(self) -> bool {
         matches!(self, Self::Function | Self::Method | Self::TraitMethod)
@@ -101,6 +119,94 @@ pub struct Node {
     pub line: Option<u32>,
     /// The item's signature as rust-analyzer prints it, e.g. `pub fn parse(&self) -> Vec<String>`.
     pub signature: Option<String>,
+    /// True for functions marked `#[test]`, `#[tokio::test]` and the like.
+    /// Left out of `graph.json` when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub test: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// What kind of unsafe code a site is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsafeKind {
+    /// `unsafe { ... }`
+    Block,
+    /// `unsafe fn`
+    Fn,
+    /// `unsafe impl Send for T`
+    Impl,
+    /// `unsafe trait`
+    Trait,
+}
+
+/// One place with unsafe code.
+///
+/// Rust's convention, which clippy checks, is that each one explains why it
+/// is sound: an `unsafe` block or impl has a `// SAFETY:` comment right above
+/// it, and an `unsafe fn` or trait has a `# Safety` section in its docs,
+/// saying what callers or implementers must guarantee. A `Safety:` line in
+/// the docs, or a `// # Safety` heading above a block, counts as well.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsafeSite {
+    pub file: String,
+    /// 1-based line of the `unsafe` keyword.
+    pub line: u32,
+    pub kind: UnsafeKind,
+    /// Node id of the item it belongs to: the function around a block, the
+    /// `unsafe fn` or trait itself, or the type in an `unsafe impl`.
+    /// `None` when the builder couldn't tell.
+    pub item: Option<String>,
+    /// For an `unsafe impl`, the trait's name, e.g. `Send`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trait_name: Option<String>,
+    /// Whether it has its `// SAFETY:` comment or `# Safety` section.
+    pub documented: bool,
+    /// An `unsafe fn` implementing a trait's `unsafe fn`. The trait documents
+    /// the contract, so it counts as documented without a section of its own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub in_trait_impl: bool,
+}
+
+/// The Cargo features the graph was built with. Neither field set means
+/// each package's default features, as with a plain `cargo build`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Features {
+    /// `--all-features`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all: bool,
+    /// `--features a,b`: these on top of the default ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listed: Vec<String>,
+}
+
+impl Features {
+    /// `default features`, `all features`, or `default features plus a, b`.
+    pub fn describe(&self) -> String {
+        if self.all {
+            "all features".to_string()
+        } else if self.listed.is_empty() {
+            "default features".to_string()
+        } else {
+            format!("default features plus {}", self.listed.join(", "))
+        }
+    }
+}
+
+/// What a file looked like when the graph was built, to tell later whether it changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    /// Relative to the workspace root.
+    pub path: String,
+    pub len: u64,
+    /// Modification time, in nanoseconds since 1970.
+    pub mtime_ns: u64,
+    /// FNV-1a hash of the content, in hex. Empty when the file changed while
+    /// the build was running, which makes it count as changed.
+    pub hash: String,
 }
 
 /// One link between two nodes.
@@ -139,8 +245,19 @@ pub struct Graph {
     pub format_version: u32,
     /// Which tools produced it, e.g. `cargo-atlas 0.1.0; rust-analyzer 0.3.3057`.
     pub produced_by: String,
+    /// The Cargo features rust-analyzer was told to turn on.
+    #[serde(default)]
+    pub features: Features,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    /// Every `unsafe` block, fn, impl and trait, sorted by file and line.
+    // `default` lets an older graph.json load far enough to report its version.
+    #[serde(default)]
+    pub unsafe_sites: Vec<UnsafeSite>,
+    /// The files the graph was built from: every indexed `.rs` file plus the
+    /// Cargo manifests.
+    #[serde(default)]
+    pub files: Vec<FileStamp>,
     pub stats: Stats,
 }
 
@@ -155,6 +272,7 @@ pub struct GraphBuilder {
     node_index: HashMap<String, usize>,
     edges: Vec<Edge>,
     edge_index: HashMap<(String, String, EdgeKind), usize>,
+    pub unsafe_sites: Vec<UnsafeSite>,
     pub stats: Stats,
 }
 
@@ -172,6 +290,10 @@ impl GraphBuilder {
 
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.node_index.get(id).map(|&i| &self.nodes[i])
+    }
+
+    pub fn node_mut(&mut self, id: &str) -> Option<&mut Node> {
+        self.node_index.get(id).map(|&i| &mut self.nodes[i])
     }
 
     /// Adds an edge, or merges it into an identical one. Both ends must already exist.
@@ -201,11 +323,18 @@ impl GraphBuilder {
         }
         self.edges
             .sort_by(|a, b| (&a.from, &a.to, a.kind).cmp(&(&b.from, &b.to, b.kind)));
+        self.unsafe_sites
+            .sort_by(|a, b| (&a.file, a.line, a.kind).cmp(&(&b.file, b.line, b.kind)));
         Graph {
             format_version: FORMAT_VERSION,
             produced_by,
+            // Filled in by the build, which knows what it asked for.
+            features: Features::default(),
             nodes: self.nodes,
             edges: self.edges,
+            unsafe_sites: self.unsafe_sites,
+            // Filled in by the build once the graph is done; see `freshness`.
+            files: Vec::new(),
             stats: self.stats,
         }
     }

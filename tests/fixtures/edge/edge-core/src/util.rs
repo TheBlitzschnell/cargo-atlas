@@ -16,3 +16,15 @@ pub fn outer() -> u32 {
 pub fn outer_rec(n: u32) -> u32 {
     if n == 0 { 0 } else { outer_rec(n - 1) }
 }
+
+/// rust-analyzer turns on `cfg(miri)` unless told otherwise, which would hide this.
+#[cfg(not(miri))]
+pub fn not_under_miri() -> u32 {
+    helper(2)
+}
+
+/// Only built with `--features extra`.
+#[cfg(feature = "extra")]
+pub fn only_with_extra() -> u32 {
+    outer()
+}

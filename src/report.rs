@@ -12,7 +12,12 @@ const TOP: usize = 10;
 pub fn markdown(graph: &Graph) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# cargo-atlas report\n");
-    let _ = writeln!(out, "Produced by {}.\n", graph.produced_by);
+    let _ = writeln!(
+        out,
+        "Produced by {}, with {}.\n",
+        graph.produced_by,
+        graph.features.describe()
+    );
 
     // Nodes by kind.
     let mut node_counts: BTreeMap<NodeKind, usize> = BTreeMap::new();
@@ -75,12 +80,27 @@ pub fn markdown(graph: &Graph) -> String {
     );
     top_list(&mut out, "Most-implemented traits", &implementors, &name_of);
 
+    let tests = graph.nodes.iter().filter(|n| n.test).count();
+    let undocumented = graph.unsafe_sites.iter().filter(|s| !s.documented).count();
+    let _ = writeln!(out, "\n## Tests and unsafe code\n");
+    let _ = writeln!(
+        out,
+        "- Test functions (marked `#[test]` or similar): {tests}. \
+         `cargo atlas tests ITEM` lists the ones that reach an item."
+    );
+    let _ = writeln!(
+        out,
+        "- Unsafe code: {} sites, {undocumented} without a `// SAFETY:` comment or \
+         `# Safety` section. `cargo atlas unsafe` lists them.",
+        graph.unsafe_sites.len()
+    );
+
     let s = &graph.stats;
     let _ = writeln!(out, "\n## Coverage\n");
     let _ = writeln!(out, "- Files indexed by rust-analyzer: {}", s.files_indexed);
     let _ = writeln!(
         out,
-        "- Files syn could not parse (no impl or derive facts): {}",
+        "- Files syn could not parse (no impl, derive, test or unsafe facts): {}",
         s.files_unparsed_by_syn
     );
     let _ = writeln!(

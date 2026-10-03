@@ -1,3 +1,4 @@
+pub mod raw;
 pub mod shapes;
 pub mod util;
 
