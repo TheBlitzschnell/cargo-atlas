@@ -47,7 +47,7 @@ one each call resolves to. Answers give file:line for everything, so read only t
 
 Every link is labeled EXACT (resolved by rust-analyzer), CANDIDATE (one of several possible \
 targets, such as the impls behind a `dyn Trait` call) or SYNTAX (read from the source text, \
-such as derives).
+such as derives and calls written in a `macro_rules!` body).
 
 Name an item by its name (`parse`), its path (`JsonReader::parse`, optionally with the crate \
 first) or the file:line of its definition (`src/json_reader.rs:10`). If a name matches several \
@@ -201,8 +201,12 @@ impl AtlasServer {
     }
 
     #[tool(
-        description = "The shortest chain of calls, type uses and impls between two items, with \
-        the file:line of each link. Answers questions like 'how does main reach this function?'",
+        description = "How one item reaches another: the shortest chain of calls from the first \
+        to the second, with the file:line of each link, including the impls that may run behind \
+        a trait call. Answers questions like 'how does main reach this function?' If no chain of \
+        calls leads from the first to the second, it tries the other way round, then the \
+        shortest connection through any link (type uses, impls, containment), and says which \
+        one it found.",
         annotations(read_only_hint = true)
     )]
     async fn path(
@@ -333,12 +337,15 @@ impl AtlasServer {
         self.load_on_first_use(&workspace).await?;
         self.reload_if_rebuilt_elsewhere(&workspace);
         let atlas = self.state().atlas.clone().context("no graph loaded")?;
-        let changed = freshness::changed(&workspace.root, &atlas.graph().files);
-        if changed.is_empty() {
+        let changes = {
+            let graph = atlas.graph();
+            freshness::changed(&workspace.root, &graph.files, &graph.discovered)
+        };
+        if changes.is_empty() {
             return Ok((atlas, None));
         }
         self.start_rebuild(&workspace);
-        Ok((atlas, Some(self.stale_note(&changed))))
+        Ok((atlas, Some(self.stale_note(&changes))))
     }
 
     fn workspace(&self) -> Result<Workspace> {
@@ -439,8 +446,10 @@ impl AtlasServer {
         let finished_meanwhile = self.state().builds > builds_before;
         // Cloned first, so the lock isn't held while the files are checked.
         let current = self.state().atlas.clone();
-        let current = current
-            .filter(|atlas| freshness::changed(&workspace.root, &atlas.graph().files).is_empty());
+        let current = current.filter(|atlas| {
+            let graph = atlas.graph();
+            freshness::changed(&workspace.root, &graph.files, &graph.discovered).is_empty()
+        });
         if let (true, Some(atlas)) = (finished_meanwhile, current) {
             return Ok(format!(
                 "A rebuild finished while this call waited, and it matches the files: {} items.",
@@ -476,7 +485,7 @@ impl AtlasServer {
         Ok(text)
     }
 
-    fn stale_note(&self, changed: &[String]) -> String {
+    fn stale_note(&self, changes: &freshness::Changes) -> String {
         let state = self.state();
         let status = match (
             &state.last_error,
@@ -501,7 +510,7 @@ impl AtlasServer {
         format!(
             "Note: {} since the graph was built, so answers about code there may be out of \
              date. {status}\n\n",
-            freshness::describe(changed)
+            changes.describe()
         )
     }
 }

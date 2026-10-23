@@ -37,14 +37,15 @@ need `rustup component add rust-analyzer rust-src`. Set
 | `src/cargo_meta.rs` | Reading `cargo metadata` |
 | `src/rust_analyzer.rs` | Running `rust-analyzer scip` with its settings, and reading the index |
 | `src/symbols.rs` | Taking rust-analyzer's symbol strings apart |
-| `src/syntax.rs` | The syn pass: impl headers, derives, test attributes, unsafe code |
+| `src/syntax.rs` | The syn pass: impl headers, derives, test attributes, unsafe code, `mod` declarations, calls in macro bodies |
+| `src/targets.rs` | Which Cargo target (library, binary, integration test...) each file belongs to |
 | `src/builder.rs` | Index, Cargo and syntax facts into one graph |
 | `src/model.rs` | Nodes, edges, confidence labels, unsafe sites, file stamps |
 | `src/freshness.rs` | Telling whether `graph.json` still matches the files |
 | `src/query.rs` | callers, callees, impls, path, explain, search, tests, unsafe |
 | `src/report.rs` | `report.md` |
 | `src/server.rs` | `cargo atlas serve`: the MCP tools and background rebuilds |
-| `tests/spike.rs`, `tests/edge.rs` | End-to-end tests on the fixtures in `tests/fixtures` |
+| `tests/spike.rs`, `tests/edge.rs`, `tests/implicit.rs` | End-to-end tests on the fixtures in `tests/fixtures`; `implicit` holds calls the code doesn't spell out and a package with several targets |
 | `tests/server.rs` | The MCP server over the real protocol, including an edit and `refresh` |
 | `tests/common/mod.rs` | Helpers shared by the end-to-end tests |
 | `bench/` | The ripgrep checks: agreement with Graphify, precision and recall samples |

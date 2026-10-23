@@ -3,6 +3,49 @@
 One entry per decision: the date, what was decided, why, and what was rejected.
 Newest first.
 
+## 2026-10-23: `path` follows calls first
+- Bug: `path` searched every kind of link in both directions, so `path main CsvReader::parse` answered `main --uses_type--> CsvReader --contains--> CsvReader::parse`: a type mention and containment, not how `main` reaches `parse`, which is what the MCP tool promised.
+- Now: the shortest chain of calls (`calls`, `may_call`, `references`, and a last `uses_type` when the goal is a type) from the first item to the second; then the other way round; only then any link, with a first line saying which it found. A type or trait starts from its methods, as in `tests`.
+- Rejected: dropping the any-link fallback. Two items that only share a type are still worth showing, said for what it is.
+
+## 2026-10-23: Test commands name each test exactly and pick its binary
+- Bug: libtest runs every test whose name contains a filter, so `-- raw::tests::first_of_empty_is_zero` also ran `first_of_empty_is_zero_slowly`, and `-p` alone builds every test binary of the package (150 integration tests in tokio).
+- Now: `--exact` with each test's full path, and `--lib`, `--bin NAME`, `--test NAME` (or `--example`, `--bench`) for the binaries the tests are in. Checked with `cargo test` on the implicit fixture: exactly the listed tests run. `#[rstest]`, `#[test_case]` and `#[test_matrix]` tests run once per case, named after the function (`adds::case_1`), so they get a command of their own without `--exact`.
+- Which target a file belongs to: `cargo metadata` gives each target's root file; the rest is found by following `mod` declarations as rustc does (`net.rs` keeps `mod tcp;` in `net/tcp.rs`; `mod.rs` and files loaded through `#[path]` own their folder). Saved as `targets` in `graph.json`, format version 4. When a test's file maps to no target, its package's command falls back to `-p` alone.
+- Rejected: cargo-nextest filter expressions, which not everyone has. The same map could split shared symbols such as `main` in `build.rs` and `src/main.rs` exactly; not done yet.
+
+## 2026-10-23: Traits from outside the workspace keep their full path
+- Bug: such a trait was a node named by its last segment, so `std::fmt::Write` and `std::io::Write`, or `std::error::Error` and `serde::de::Error`, were one node, linked as SYNTAX.
+- Now: the impl header's line has an occurrence of the trait with its exact symbol (`core … fmt/Write#`), so the node uses it and the link is EXACT. When a line names two such traits (`impl<W: io::Write> fmt::Write for Both<W>`), syn's column for the trait picks the occurrence; syn's columns are now converted to bytes, the unit of the index. `std::fmt::Write` finds `core::fmt::Write`, which std re-exports.
+- Bug: `impls Debug` couldn't be answered when one type derived `Debug` and another implemented it by hand: two nodes named `Debug` without a location, and the list of choices suggested `src/main.rs:4`. Now `impls` answers for the trait and the derive of the same name together, rows from the derive marked `(derive)`, when only one trait from outside has that name. A derive can be picked by its id, `derive:Debug`; the list of choices shows names that pick each item, and its example is one of them.
+- Correction: the builder's comment said a trait from outside the workspace has no symbol in the index, which is why the 2026-09-25 entry lists such traits under SYNTAX. It has one at every reference; what the index lacks for it is `SymbolInformation` (kind, signature, docs), which rust-analyzer writes only for files under the workspace root.
+
+## 2026-10-23: Operators are calls; consts and statics own references
+- Bug: rust-analyzer resolves `a + b`, `-x`, `*p`, `v[i]` and `.await` to the method that runs and records it on the operator. No `(` follows an operator, so the link was `references`, printed "named, not called". An occurrence whose text isn't a name is now a call.
+- Bug: a reference inside a const or static belonged to nothing, so `static CONFIG: LazyLock<Config> = LazyLock::new(|| load_config())` gave `load_config` no caller, and `tests` missed the tests that read `CONFIG`. Consts and statics now own the references in their initializers, like functions and types.
+- Found: rust-analyzer looks an operator's impl up for the operand's type as written, so `ledger[0]` on a `&Ledger` resolves to `Index::index` in std and isn't linked. Listed in the README's limits.
+
+## 2026-10-23: Calls Rust makes without naming them
+- `drop`, `from` behind `?` (rust-analyzer resolves `?` to `Try::branch` only), `next` in a `for` loop and `fmt` in a format string have no occurrence. For a method of an impl of a trait from outside the workspace that no call reaches, `callers` says why the list is empty, and `tests` lists the tests that use the impl's type (through its methods, or functions, consts and statics that name it) instead of "no tests reach it". For choosing which tests to run, missing one is worse than running a few extra.
+- Rejected: linking each `?` to the `From` impls of its error type by reading types from the source: guesswork, and the fallback through the type covers what `tests` needs.
+
+## 2026-10-23: Calls in `macro_rules!` bodies, matched by path (SYNTAX)
+- Found on the new fixture: rust-analyzer records no occurrence for a call written in a macro body, and none where the macro is used, so `report -> log_err! -> write_line` broke after the macro.
+- Now: the syn pass reads each rule's transcriber (`=> { ... }`, not the matcher) and the builder links the macro to the function a call's path names (`$crate::log::write_line`) when exactly one callable of the macro's package matches. SYNTAX, noted "in the macro's body, matched by path". Method calls, macro variables (`$f(...)`) and definitions are skipped.
+- Rejected: matching the last name across the workspace, Graphify's approach, which links a `new` to the wrong `new`.
+
+## 2026-10-23: Freshness notices new target files
+- Bug: only files the build read were checked, so a new `tests/api.rs`, a new target that no `mod` line names, went unnoticed.
+- Now: the build records the files where Cargo finds targets on its own (`src/main.rs`, `src/lib.rs`, `build.rs`, and `*.rs` or `*/main.rs` in `src/bin`, `tests`, `examples`, `benches`), and every check lists them again: a few `read_dir` calls per package.
+- Rejected: reporting any new `.rs` file. A new module file changes nothing until a `mod` line names it, and that line's file is stamped.
+
+## 2026-10-23: rust-analyzer builds in `target/rust-analyzer` and runs in the workspace
+- Its `cargo check` for build scripts and proc macros used the workspace's `target/`, so a background rebuild held Cargo's lock on it and an assistant's `cargo test` waited. `cargo.targetDir: true` moves that build to `target/rust-analyzer`, at the cost of building the dependencies once more there.
+- It is also started in the workspace, so rustup picks the toolchain the workspace's `rust-toolchain.toml` names, as it already did for `rustc --print sysroot`.
+
+## 2026-10-23: Skipped end-to-end tests say so
+- With `CARGO_ATLAS_SKIP_RA_TESTS=1`, the end-to-end tests report `ok` while checking nothing. Each test binary now prints a warning once, written straight to stderr because libtest hides `eprintln!` output from tests that pass.
+
 ## 2026-09-26: Compare against Claude Code's LSP tool next
 - Asked on LinkedIn: Claude Code's LSP tool already gets callers and trait impls from rust-analyzer, so what does this add? Its answers need a file and a position for each question and come one symbol at a time; cargo-atlas answers by name, across the workspace, with every call site, plus tests and unsafe code. Whether that saves an assistant any work is unmeasured.
 - Plan: 10 questions about ripgrep, each answered by Claude Code with the LSP tool alone and with cargo-atlas alone. Count tool calls, tokens and wrong answers.

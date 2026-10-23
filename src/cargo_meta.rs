@@ -1,7 +1,8 @@
 //! Reading the workspace layout from `cargo metadata`.
 //!
 //! We only need a little of Cargo's output: which packages the workspace has,
-//! where their manifests are, and which crates each one depends on.
+//! where their manifests are, which crates each one depends on, and the root
+//! file of each target (library, binaries, integration tests...).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,6 +24,19 @@ pub struct Package {
     /// Absolute path of the package's `Cargo.toml`.
     pub manifest_path: PathBuf,
     pub dependencies: Vec<Dependency>,
+    #[serde(default)]
+    pub targets: Vec<CargoTarget>,
+}
+
+/// One target of a package, as Cargo lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CargoTarget {
+    /// `edge_core` for the library, `shapes` for `tests/shapes.rs`.
+    pub name: String,
+    /// `["lib"]`, `["bin"]`, `["test"]`, `["custom-build"]` and so on.
+    pub kind: Vec<String>,
+    /// Absolute path of the target's root file.
+    pub src_path: PathBuf,
 }
 
 /// One entry from a package's `[dependencies]`, `[dev-dependencies]` or `[build-dependencies]`.

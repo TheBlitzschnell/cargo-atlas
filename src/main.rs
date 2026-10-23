@@ -16,6 +16,7 @@ mod rust_analyzer;
 mod server;
 mod symbols;
 mod syntax;
+mod targets;
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -166,7 +167,7 @@ fn build(dir: &Path, features: &Features) -> Result<String> {
     eprintln!(
         "Indexing {} with {}, {} ...",
         workspace.root.display(),
-        rust_analyzer::version()?,
+        rust_analyzer::version(&workspace.root)?,
         features.describe()
     );
     let built = pipeline::run(&workspace, features)?;
@@ -180,11 +181,12 @@ fn answer(dir: &Path, query: Query) -> Result<String> {
     let workspace = cargo_meta::load(dir)?;
     let atlas = Atlas::load(&pipeline::graph_path(&workspace))?;
     // The answer comes from the last build; say so if the code moved on since.
-    let changed = freshness::changed(&workspace.root, &atlas.graph().files);
-    if !changed.is_empty() {
+    let graph = atlas.graph();
+    let changes = freshness::changed(&workspace.root, &graph.files, &graph.discovered);
+    if !changes.is_empty() {
         eprintln!(
             "note: {} since the last build. Run `cargo atlas build` to update the graph.",
-            freshness::describe(&changed)
+            changes.describe()
         );
     }
     match query {

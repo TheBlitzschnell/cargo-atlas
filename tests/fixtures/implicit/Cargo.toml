@@ -1,0 +1,10 @@
+# Calls the code doesn't spell out, and a package with several targets.
+# A standalone workspace, so Cargo never looks at the parent.
+[package]
+name = "implicit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[workspace]

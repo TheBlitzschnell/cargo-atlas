@@ -296,7 +296,7 @@ fn tests_that_reach_a_function_directly_or_through_calls() {
         "{out}"
     );
     assert!(
-        out.contains("cargo test -p edge-core -- raw::tests::first_of_empty_is_zero"),
+        out.contains("cargo test -p edge-core --lib -- --exact raw::tests::first_of_empty_is_zero"),
         "{out}"
     );
 
@@ -311,7 +311,7 @@ fn tests_that_reach_a_function_directly_or_through_calls() {
 
     let out = atlas(F, &["tests", "helper_local"]);
     assert!(
-        out.contains("cargo test -p edge-app -- tests::calls_helper_local"),
+        out.contains("cargo test -p edge-app --bin edge-app -- --exact tests::calls_helper_local"),
         "{out}"
     );
     assert!(atlas(F, &["tests", "helper"]).contains("(no tests reach it)"));
@@ -333,7 +333,7 @@ fn tests_in_the_tests_folder_and_through_dyn_calls() {
     );
     assert!(!out.contains("square_area_is_four"), "{out}");
     assert!(
-        out.contains("cargo test -p edge-core -- total_of_two_shapes"),
+        out.contains("cargo test -p edge-core --test shapes -- --exact total_of_two_shapes"),
         "{out}"
     );
 
@@ -343,7 +343,9 @@ fn tests_in_the_tests_folder_and_through_dyn_calls() {
         "{out}"
     );
     assert!(
-        out.contains("cargo test -p edge-core -- square_area_is_four total_of_two_shapes"),
+        out.contains(
+            "cargo test -p edge-core --test shapes -- --exact square_area_is_four total_of_two_shapes"
+        ),
         "{out}"
     );
 

@@ -52,7 +52,12 @@ impl Built {
 pub fn run(workspace: &Workspace, features: &Features) -> Result<Built> {
     let started = Instant::now();
     let started_at = SystemTime::now();
-    let ra_version = rust_analyzer::version()?;
+    let ra_version = rust_analyzer::version(&workspace.root)?;
+    // Before indexing, like the stamps: a target file added during the build
+    // then counts as new at the next check.
+    let manifest_paths = manifests(workspace);
+    let manifest_refs: Vec<&str> = manifest_paths.iter().map(String::as_str).collect();
+    let discovered = freshness::discover(&workspace.root, &manifest_refs);
     let atlas_dir = workspace.root.join(".atlas");
     std::fs::create_dir_all(&atlas_dir).context("creating .atlas")?;
     // A `*` .gitignore inside keeps the whole folder out of git without touching the repo's own.
@@ -81,8 +86,9 @@ pub fn run(workspace: &Workspace, features: &Features) -> Result<Built> {
         .iter()
         .map(|d| d.relative_path.clone())
         .collect();
-    files.extend(manifests(workspace));
+    files.extend(manifest_paths);
     graph.files = freshness::stamp(&workspace.root, &files, started_at);
+    graph.discovered = discovered;
 
     save(&graph, &graph_path(workspace))?;
     Ok(Built {

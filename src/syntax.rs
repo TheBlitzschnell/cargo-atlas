@@ -12,6 +12,12 @@
 //!   explains why it is sound. Comments aren't in syn's tree either, so that
 //!   check reads the lines around the `unsafe` keyword.
 //!
+//! - Out-of-line `mod name;` declarations, so each file can be traced to the
+//!   Cargo target (library, binary, integration test...) that builds it.
+//! - Calls written in a `macro_rules!` body. The index has no occurrence for
+//!   them: the body is a template, and the expanded code points back into it
+//!   without a token of its own at the place the macro is used.
+//!
 //! syn finds where these are. The builder then asks the index which exact
 //! symbol the name on that line refers to.
 //!
@@ -29,11 +35,49 @@ use syn::visit::Visit;
 
 use crate::model::UnsafeKind;
 
-/// A name and the 1-based line it sits on.
+/// A name and where it sits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameAt {
     pub name: String,
+    /// 1-based line.
     pub line: u32,
+    /// 0-based column in bytes, the unit rust-analyzer's index uses. It tells
+    /// apart two names on one line, as in `impl fmt::Write for W<dyn io::Write>`.
+    pub column: u32,
+}
+
+/// A function with a test attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestFn {
+    pub name: NameAt,
+    /// `#[rstest]`, `#[test_case(...)]`: one test per case, each named after the function.
+    pub parameterized: bool,
+}
+
+/// A `macro_rules!` definition and the calls written in its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroBody {
+    pub name: NameAt,
+    pub calls: Vec<MacroCall>,
+}
+
+/// `$crate::log::write_line(...)` in a macro body: the path, without a
+/// leading `$crate`, `crate`, `self` or `super`, and the line it is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroCall {
+    pub path: Vec<String>,
+    pub line: u32,
+}
+
+/// An out-of-line module declaration, `mod name;`, whose code is in another file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModDecl {
+    pub name: String,
+    /// Inline modules around the declaration, outermost first:
+    /// `mod a { mod b; }` gives `["a"]` for `b`.
+    pub inline_path: Vec<String>,
+    /// The `#[path = "..."]` attribute, if any.
+    pub path_attr: Option<String>,
 }
 
 /// One `impl ... { }` block.
@@ -81,8 +125,10 @@ pub struct FileFacts {
     pub impls: Vec<ImplBlock>,
     pub derives: Vec<TypeDerives>,
     /// Functions with a test attribute such as `#[test]` or `#[tokio::test]`.
-    pub tests: Vec<NameAt>,
+    pub tests: Vec<TestFn>,
     pub unsafe_code: Vec<UnsafeCode>,
+    pub mods: Vec<ModDecl>,
+    pub macro_bodies: Vec<MacroBody>,
 }
 
 /// Parses one file. Returns `None` if it can't be read or isn't valid Rust.
@@ -98,6 +144,7 @@ pub fn scan_source(source: &str) -> Option<FileFacts> {
         lines: source.lines().collect(),
         statement_lines: Vec::new(),
         impl_has_trait: Vec::new(),
+        inline_mods: Vec::new(),
         facts: FileFacts::default(),
     };
     collector.visit_file(&file);
@@ -112,18 +159,20 @@ struct Collector<'s> {
     /// For each impl block the walk is inside, innermost last: whether it
     /// implements a trait.
     impl_has_trait: Vec<bool>,
+    /// Inline modules (`mod a { ... }`) the walk is inside, outermost first.
+    inline_mods: Vec<String>,
     facts: FileFacts,
 }
 
 impl<'ast> Visit<'ast> for Collector<'_> {
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         let span = item.span();
-        let self_type = last_name_in_type(&item.self_ty);
+        let self_type = self.last_name_in_type(&item.self_ty);
         let trait_name = item
             .trait_
             .as_ref()
             .and_then(|(_, path, _)| path.segments.last())
-            .map(|segment| name_at(&segment.ident));
+            .map(|segment| self.name_at(&segment.ident));
         if let Some(token) = &item.unsafety {
             let (line, column) = line_column(token.span);
             self.facts.unsafe_code.push(UnsafeCode {
@@ -164,11 +213,31 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        if item.attrs.iter().any(is_test_attribute) {
-            self.facts.tests.push(name_at(&item.sig.ident));
+        if let Some(parameterized) = test_attribute(&item.attrs) {
+            self.facts.tests.push(TestFn {
+                name: self.name_at(&item.sig.ident),
+                parameterized,
+            });
         }
         self.record_unsafe_fn(&item.attrs, &item.sig, false);
         syn::visit::visit_item_fn(self, item);
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        let name = item.ident.to_string();
+        if item.content.is_some() {
+            // `mod a { ... }`: out-of-line modules declared inside live in `a/`.
+            self.inline_mods.push(name);
+            syn::visit::visit_item_mod(self, item);
+            self.inline_mods.pop();
+        } else {
+            self.facts.mods.push(ModDecl {
+                name,
+                inline_path: self.inline_mods.clone(),
+                path_attr: path_attribute(&item.attrs),
+            });
+            syn::visit::visit_item_mod(self, item);
+        }
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
@@ -189,7 +258,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
                 kind: UnsafeKind::Trait,
                 line,
                 column,
-                name: Some(name_at(&item.ident)),
+                name: Some(self.name_at(&item.ident)),
                 trait_name: None,
                 documented: has_safety_section(&item.attrs)
                     || self.has_safety_comment(line, column),
@@ -201,6 +270,16 @@ impl<'ast> Visit<'ast> for Collector<'_> {
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.walk_macro_contents(mac);
+    }
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if let (true, Some(ident)) = (item.mac.path.is_ident("macro_rules"), &item.ident) {
+            self.facts.macro_bodies.push(MacroBody {
+                name: self.name_at(ident),
+                calls: transcriber_calls(item.mac.tokens.clone()),
+            });
+        }
+        syn::visit::visit_item_macro(self, item);
     }
 
     fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
@@ -277,9 +356,36 @@ impl Collector<'_> {
         let derives = derive_names(attrs);
         if !derives.is_empty() {
             self.facts.derives.push(TypeDerives {
-                type_name: name_at(ident),
+                type_name: self.name_at(ident),
                 derives,
             });
+        }
+    }
+
+    /// An identifier and its position, with the column in bytes.
+    fn name_at(&self, ident: &syn::Ident) -> NameAt {
+        let start = ident.span().start();
+        // proc-macro2 counts columns in characters; the index counts bytes.
+        let column = self
+            .lines
+            .get(start.line.saturating_sub(1))
+            .and_then(|text| text.char_indices().nth(start.column))
+            .map_or(start.column, |(byte, _)| byte);
+        NameAt {
+            name: ident.to_string(),
+            line: start.line as u32,
+            column: column as u32,
+        }
+    }
+
+    /// `CsvReader` for `CsvReader`, `crate::csv::CsvReader`, `&CsvReader` or `Vec<CsvReader>`'s outer `Vec`.
+    fn last_name_in_type(&self, ty: &syn::Type) -> Option<NameAt> {
+        match ty {
+            syn::Type::Path(p) => p.path.segments.last().map(|s| self.name_at(&s.ident)),
+            syn::Type::Reference(r) => self.last_name_in_type(&r.elem),
+            syn::Type::Paren(p) => self.last_name_in_type(&p.elem),
+            syn::Type::Group(g) => self.last_name_in_type(&g.elem),
+            _ => None,
         }
     }
 
@@ -297,7 +403,7 @@ impl Collector<'_> {
                 kind: UnsafeKind::Fn,
                 line,
                 column,
-                name: Some(name_at(&sig.ident)),
+                name: Some(self.name_at(&sig.ident)),
                 trait_name: None,
                 documented: in_trait_impl
                     || has_safety_section(attrs)
@@ -373,12 +479,13 @@ fn has_safety_section(attrs: &[syn::Attribute]) -> bool {
     attrs
         .iter()
         .filter(|a| a.path().is_ident("doc"))
-        .filter_map(doc_text)
+        .filter_map(string_value)
         .any(|text| text.lines().any(mentions_safety))
 }
 
-/// The text of one `///` line, which syn sees as `#[doc = "..."]`.
-fn doc_text(attr: &syn::Attribute) -> Option<String> {
+/// The string in an attribute written `#[name = "..."]`, such as one `///`
+/// line, which syn sees as `#[doc = "..."]`, or `#[path = "..."]`.
+fn string_value(attr: &syn::Attribute) -> Option<String> {
     let syn::Meta::NameValue(name_value) = &attr.meta else {
         return None;
     };
@@ -392,41 +499,125 @@ fn doc_text(attr: &syn::Attribute) -> Option<String> {
     Some(text.value())
 }
 
-/// `#[test]` and the attributes test frameworks use instead: `#[tokio::test]`,
-/// `#[sqlx::test]`, `#[rstest]`, `#[test_case(...)]`, `#[wasm_bindgen_test]`.
-/// `#[cfg(test)]` is not one: it marks code that only exists in test builds.
-fn is_test_attribute(attr: &syn::Attribute) -> bool {
-    let Some(last) = attr.path().segments.last() else {
-        return false;
-    };
-    let name = last.ident.to_string();
-    name == "test"
-        || name.ends_with("_test")
-        || matches!(name.as_str(), "rstest" | "test_case" | "quickcheck")
+/// Whether a function is a test, from its attributes: `Some(false)` for one
+/// that runs once, such as `#[test]`, `#[tokio::test]`, `#[sqlx::test]` or
+/// `#[wasm_bindgen_test]`; `Some(true)` for one that runs once per case,
+/// `#[rstest]`, `#[test_case(...)]` or `#[test_matrix(...)]`. `#[cfg(test)]`
+/// is not a test attribute: it marks code that only exists in test builds.
+fn test_attribute(attrs: &[syn::Attribute]) -> Option<bool> {
+    let mut found = None;
+    for attr in attrs {
+        let Some(last) = attr.path().segments.last() else {
+            continue;
+        };
+        let name = last.ident.to_string();
+        if matches!(name.as_str(), "rstest" | "test_case" | "test_matrix") {
+            return Some(true);
+        }
+        if name == "test" || name.ends_with("_test") || name == "quickcheck" {
+            found = Some(false);
+        }
+    }
+    found
+}
+
+/// The file named by `#[path = "..."]`, which overrides where a module's code is.
+fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs
+        .iter()
+        .filter(|a| a.path().is_ident("path"))
+        .find_map(string_value)
+}
+
+/// The calls in a `macro_rules!` body's rules, `(matcher) => { transcriber };`.
+/// Only transcribers are code; a matcher may hold literal tokens like `call(`.
+fn transcriber_calls(body: proc_macro2::TokenStream) -> Vec<MacroCall> {
+    use proc_macro2::TokenTree;
+    let trees: Vec<TokenTree> = body.into_iter().collect();
+    let mut calls = Vec::new();
+    for window in trees.windows(3) {
+        let [
+            TokenTree::Punct(eq),
+            TokenTree::Punct(gt),
+            TokenTree::Group(transcriber),
+        ] = window
+        else {
+            continue;
+        };
+        if eq.as_char() == '=' && gt.as_char() == '>' {
+            calls_in_tokens(transcriber.stream(), &mut calls);
+        }
+    }
+    calls
+}
+
+/// Calls written in a macro body: a name or path followed by `(...)`, such
+/// as `write_line(...)` or `$crate::log::write_line(...)`. Left out: method
+/// calls (`.name(...)`), whose target depends on a type the tokens don't
+/// show; macro variables (`$f(...)`); and the names after `fn`, `struct`,
+/// `enum` or `union`, which define rather than call.
+fn calls_in_tokens(tokens: proc_macro2::TokenStream, calls: &mut Vec<MacroCall>) {
+    use proc_macro2::{Delimiter, TokenTree};
+    let punct = |tree: Option<&TokenTree>, ch: char| matches!(tree, Some(TokenTree::Punct(p)) if p.as_char() == ch);
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut i = 0;
+    while i < trees.len() {
+        let ident = match &trees[i] {
+            TokenTree::Group(group) => {
+                calls_in_tokens(group.stream(), calls);
+                i += 1;
+                continue;
+            }
+            TokenTree::Ident(ident) => ident,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let before = i.checked_sub(1).map(|b| &trees[b]);
+        let first = ident.to_string();
+        let skip = punct(before, '.')
+            || (punct(before, '$') && first != "crate")
+            || matches!(before, Some(TokenTree::Ident(k)) if ["fn", "struct", "enum", "union"].contains(&k.to_string().as_str()));
+        // Read `a::b::c`: each `::` is two `:` tokens.
+        let mut path = vec![first];
+        let mut last = ident;
+        let mut j = i + 1;
+        while punct(trees.get(j), ':') && punct(trees.get(j + 1), ':') {
+            let Some(TokenTree::Ident(next)) = trees.get(j + 2) else {
+                break;
+            };
+            path.push(next.to_string());
+            last = next;
+            j += 3;
+        }
+        let called = matches!(trees.get(j), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis);
+        while path
+            .first()
+            .is_some_and(|s| matches!(s.as_str(), "crate" | "self" | "super"))
+        {
+            path.remove(0);
+        }
+        let keyword = path.len() == 1
+            && matches!(
+                path[0].as_str(),
+                "if" | "while" | "match" | "return" | "in" | "for" | "loop" | "let" | "move"
+            );
+        if called && !skip && !keyword && !path.is_empty() {
+            calls.push(MacroCall {
+                path,
+                line: last.span().start().line as u32,
+            });
+        }
+        // The argument group, if any, is walked on the next pass.
+        i = j;
+    }
 }
 
 /// 1-based line and 0-based column of a token.
 fn line_column(span: proc_macro2::Span) -> (u32, u32) {
     let start = span.start();
     (start.line as u32, start.column as u32)
-}
-
-fn name_at(ident: &syn::Ident) -> NameAt {
-    NameAt {
-        name: ident.to_string(),
-        line: ident.span().start().line as u32,
-    }
-}
-
-/// `CsvReader` for `CsvReader`, `crate::csv::CsvReader`, `&CsvReader` or `Vec<CsvReader>`'s outer `Vec`.
-fn last_name_in_type(ty: &syn::Type) -> Option<NameAt> {
-    match ty {
-        syn::Type::Path(p) => p.path.segments.last().map(|s| name_at(&s.ident)),
-        syn::Type::Reference(r) => last_name_in_type(&r.elem),
-        syn::Type::Paren(p) => last_name_in_type(&p.elem),
-        syn::Type::Group(g) => last_name_in_type(&g.elem),
-        _ => None,
-    }
 }
 
 /// Reads `#[derive(Debug, Clone, serde::Serialize)]` into `["Debug", "Clone", "Serialize"]`.
@@ -461,16 +652,27 @@ mod tests {
             block.trait_name,
             Some(NameAt {
                 name: "T".into(),
-                line: 4
+                line: 4,
+                column: 5
             })
         );
         assert_eq!(
             block.self_type,
             Some(NameAt {
                 name: "A".into(),
-                line: 4
+                line: 4,
+                column: 11
             })
         );
+    }
+
+    #[test]
+    fn columns_are_counted_in_bytes_like_the_index() {
+        // "é" is one character but two bytes; the index counts bytes.
+        let facts = scan("struct É;\ntrait Ü {}\nimpl/*é*/ Ü for É {}\n");
+        let block = &facts.impls[0];
+        assert_eq!(block.trait_name.as_ref().map(|t| t.column), Some(11));
+        assert_eq!(block.self_type.as_ref().map(|t| t.column), Some(18));
     }
 
     #[test]
@@ -503,18 +705,95 @@ fn only_in_test_builds() {}
 
 #[rstest]
 fn with_rstest() {}
+
+#[test_case(1 ; \"one\")]
+#[test_case(2 ; \"two\")]
+fn with_cases(n: u32) {}
 ";
-        let names: Vec<(String, u32)> = scan(source)
+        let found: Vec<(String, u32, bool)> = scan(source)
             .tests
             .into_iter()
-            .map(|t| (t.name, t.line))
+            .map(|t| (t.name.name, t.name.line, t.parameterized))
             .collect();
         assert_eq!(
-            names,
+            found,
             vec![
-                ("plain".to_string(), 2),
-                ("with_tokio".to_string(), 5),
-                ("with_rstest".to_string(), 11)
+                ("plain".to_string(), 2, false),
+                ("with_tokio".to_string(), 5, false),
+                ("with_rstest".to_string(), 11, true),
+                ("with_cases".to_string(), 15, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_calls_written_in_macro_bodies() {
+        let source = "\
+macro_rules! log_err {
+    (call($e:expr)) => {
+        $crate::log::write_line(&format!(\"{}\", $e))
+    };
+    ($f:ident) => {{
+        helper();
+        x.method();
+        $f(1);
+        fn defined_here() {}
+        Some(other::path::thing(2))
+    }};
+}
+";
+        let facts = scan(source);
+        let body = &facts.macro_bodies[0];
+        assert_eq!(body.name.name, "log_err");
+        let calls: Vec<(String, u32)> = body
+            .calls
+            .iter()
+            .map(|c| (c.path.join("::"), c.line))
+            .collect();
+        // Not `call` (in a matcher), `method` (a method), `$f` (a macro
+        // variable), `defined_here` (a definition) or `format` (a macro).
+        assert_eq!(
+            calls,
+            vec![
+                ("log::write_line".to_string(), 3),
+                ("helper".to_string(), 6),
+                ("Some".to_string(), 10),
+                ("other::path::thing".to_string(), 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn records_out_of_line_modules_with_their_inline_path_and_path_attribute() {
+        let source = "\
+mod plain;
+mod inline {
+    mod nested;
+    #[path = \"elsewhere/x.rs\"]
+    mod moved;
+    fn f() {}
+}
+mod with_body { fn g() {} }
+cfg_feature! {
+    mod from_a_macro;
+}
+";
+        let mods: Vec<(String, Vec<String>, Option<String>)> = scan(source)
+            .mods
+            .into_iter()
+            .map(|m| (m.name, m.inline_path, m.path_attr))
+            .collect();
+        assert_eq!(
+            mods,
+            vec![
+                ("plain".to_string(), vec![], None),
+                ("nested".to_string(), vec!["inline".to_string()], None),
+                (
+                    "moved".to_string(),
+                    vec!["inline".to_string()],
+                    Some("elsewhere/x.rs".to_string())
+                ),
+                ("from_a_macro".to_string(), vec![], None),
             ]
         );
     }
@@ -544,7 +823,7 @@ macro_rules! template {
 ";
         let facts = scan(source);
         assert_eq!(facts.tests.len(), 1);
-        assert_eq!(facts.tests[0].name, "inside_an_item_macro");
+        assert_eq!(facts.tests[0].name.name, "inside_an_item_macro");
         let sites: Vec<(u32, bool)> = facts
             .unsafe_code
             .iter()

@@ -211,6 +211,42 @@ pub fn parent(symbol: &str) -> Option<String> {
     Some(format_symbol(parsed))
 }
 
+/// `GlobBuilder<'a>::build` becomes `GlobBuilder::build`, and
+/// `<Wrapper<T> as Area>::area` becomes `<Wrapper as Area>::area`. A `<`
+/// right after a name opens generic arguments; the `<` of `<T as Trait>`
+/// doesn't follow a name, so it stays.
+pub fn strip_generics(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut depth = 0;
+    let mut previous: Option<char> = None;
+    for ch in name.chars() {
+        if depth > 0 {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '<' && previous.is_some_and(|p| p.is_alphanumeric() || p == '_') {
+            depth = 1;
+            continue;
+        }
+        out.push(ch);
+        previous = Some(ch);
+    }
+    out
+}
+
+/// `shapes::<Square as Area>::area` becomes `shapes::Square::area`.
+/// Expects a name already passed through [`strip_generics`].
+pub fn without_trait(name: &str) -> Option<String> {
+    let start = name.find('<')?;
+    let (self_type, rest) = name[start + 1..].split_once(" as ")?;
+    let (_, item) = rest.split_once(">::")?;
+    Some(format!("{}{self_type}::{item}", &name[..start]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +323,41 @@ mod tests {
         assert_eq!(parent_of("main()."), None);
         // Items in impl blocks have no symbol parent; the builder uses the impl header.
         assert_eq!(parent_of("loader/impl#[CsvReader][Loader]load()."), None);
+    }
+
+    #[test]
+    fn strips_generic_arguments_but_not_trait_brackets() {
+        assert_eq!(
+            strip_generics("GlobBuilder<'a>::build"),
+            "GlobBuilder::build"
+        );
+        assert_eq!(
+            strip_generics("<Wrapper<T> as Area>::area"),
+            "<Wrapper as Area>::area"
+        );
+        assert_eq!(strip_generics("<Vec<Box<dyn A>> as B>::c"), "<Vec as B>::c");
+        assert_eq!(strip_generics("plain::path"), "plain::path");
+    }
+
+    #[test]
+    fn a_trait_impl_method_is_also_type_then_method() {
+        assert_eq!(
+            without_trait("shapes::<Square as Area>::area").as_deref(),
+            Some("shapes::Square::area")
+        );
+        assert_eq!(without_trait("Square::area"), None);
+    }
+
+    #[test]
+    fn std_and_dependency_symbols_parse_like_workspace_ones() {
+        // rust-analyzer gives std's crates a URL where a version would be.
+        let s = parse(
+            "rust-analyzer cargo core https://github.com/rust-lang/rust/library/core fmt/Write#",
+        )
+        .expect("symbol should parse");
+        assert_eq!(
+            (s.package.as_str(), s.full_path(), s.shape),
+            ("core", "fmt::Write".to_string(), Shape::Type)
+        );
     }
 }
