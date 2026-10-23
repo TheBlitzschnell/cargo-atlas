@@ -1,0 +1,4 @@
+# Edge cases for cargo-atlas. A standalone workspace, so Cargo never looks at the parent.
+[workspace]
+members = ["edge-core", "edge-app"]
+resolver = "3"

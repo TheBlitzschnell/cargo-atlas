@@ -1,0 +1,9 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# Standalone workspace so Cargo never looks at the parent directory.
+[workspace]

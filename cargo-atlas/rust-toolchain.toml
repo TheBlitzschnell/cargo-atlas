@@ -1,0 +1,8 @@
+# Pinned so builds and test output are reproducible.
+# rustup reads this file and installs the toolchain and components on first use.
+# rust-src matters: without the standard library's source, rust-analyzer can't
+# infer types that come from std (iterators, Vec, Option), and calls made on
+# those values go unresolved.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-src"]
