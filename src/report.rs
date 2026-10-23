@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 use crate::model::{Confidence, EdgeKind, Graph, NodeKind};
-use crate::query::{confidence_label, kind_label, kind_name};
+use crate::query::{confidence_label, kind_label, kind_name, qualified};
 
 /// How many rows to show in each "top" list.
 const TOP: usize = 10;
@@ -46,11 +46,20 @@ pub fn markdown(graph: &Graph) -> String {
         );
     }
 
-    // Most-called functions: distinct callers, not call sites.
-    let name_of: HashMap<&str, &str> = graph
+    // Most-called functions: distinct callers, not call sites. A trait from
+    // outside the workspace goes by its full path: `core::fmt::Write` and
+    // `std::io::Write` are both `Write`.
+    let name_of: HashMap<&str, String> = graph
         .nodes
         .iter()
-        .map(|n| (n.id.as_str(), n.name.as_str()))
+        .map(|n| {
+            let name = if n.kind == NodeKind::ExternalTrait {
+                qualified(n)
+            } else {
+                n.name.clone()
+            };
+            (n.id.as_str(), name)
+        })
         .collect();
     // `implements` also links impl methods to trait methods; count only whole traits.
     let is_trait: HashMap<&str, bool> = graph
@@ -139,7 +148,7 @@ fn top_list(
     out: &mut String,
     title: &str,
     counts: &HashMap<&str, usize>,
-    name_of: &HashMap<&str, &str>,
+    name_of: &HashMap<&str, String>,
 ) {
     let mut rows: Vec<(&str, usize)> = counts.iter().map(|(id, c)| (*id, *c)).collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -153,7 +162,7 @@ fn top_list(
         let _ = writeln!(
             out,
             "| `{}` | {count} |",
-            name_of.get(id).copied().unwrap_or(id)
+            name_of.get(id).map_or(id, String::as_str)
         );
     }
 }

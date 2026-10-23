@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// Bump this when the shape of `graph.json` changes.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// What kind of Rust item a node stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -28,8 +28,9 @@ pub enum NodeKind {
     Macro,
     /// A derive name such as `Clone`, read from `#[derive(...)]`.
     Derive,
-    /// A trait from outside the workspace (for example `std::fmt::Display`),
-    /// known only by name because the index has no entry for it.
+    /// A trait from outside the workspace that a workspace type implements,
+    /// such as `core::fmt::Display`. The index names it exactly; its
+    /// definition is in std or a dependency, so it has no location.
     ExternalTrait,
 }
 
@@ -123,6 +124,12 @@ pub struct Node {
     /// Left out of `graph.json` when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub test: bool,
+    /// True for a test that runs once per case, such as `#[rstest]` or
+    /// `#[test_case(...)]`. Each case is its own test, named after the function
+    /// (`adds::case_1`), so `cargo test --exact` can't select them by the
+    /// function's own name.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parameterized: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -196,6 +203,42 @@ impl Features {
     }
 }
 
+/// What kind of Cargo target a [`Target`] is, which decides how `cargo test` selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    /// The library: `cargo test --lib`. Proc-macro and cdylib crates count too.
+    Lib,
+    /// A binary: `cargo test --bin NAME`.
+    Bin,
+    /// An integration test in `tests/`: `cargo test --test NAME`.
+    Test,
+    /// `cargo test --example NAME`.
+    Example,
+    /// `cargo test --bench NAME`.
+    Bench,
+    /// `build.rs`, which has no tests.
+    BuildScript,
+}
+
+/// One Cargo target and the files it is built from.
+///
+/// `cargo test` builds one test binary per target, and a test's name is its
+/// module path inside that target, so a precise test command needs to know
+/// which target each test's file belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    /// The Cargo package, e.g. `edge-core`.
+    pub package: String,
+    /// The target's name, e.g. `shapes` for `tests/shapes.rs`.
+    pub name: String,
+    pub kind: TargetKind,
+    /// Relative to the workspace root, the target's root file first. A file
+    /// can belong to several targets, such as a `tests/common/mod.rs` that
+    /// two integration tests both declare.
+    pub files: Vec<String>,
+}
+
 /// What a file looked like when the graph was built, to tell later whether it changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStamp {
@@ -258,6 +301,14 @@ pub struct Graph {
     /// Cargo manifests.
     #[serde(default)]
     pub files: Vec<FileStamp>,
+    /// Files in the places Cargo looks for targets on its own (`src/main.rs`,
+    /// `src/bin/`, `tests/`, `examples/`, `benches/`, `build.rs`) when the
+    /// graph was built. A file that appears there later is a new target.
+    #[serde(default)]
+    pub discovered: Vec<String>,
+    /// Every Cargo target in the workspace and the files it is built from.
+    #[serde(default)]
+    pub targets: Vec<Target>,
     pub stats: Stats,
 }
 
@@ -333,8 +384,11 @@ impl GraphBuilder {
             nodes: self.nodes,
             edges: self.edges,
             unsafe_sites: self.unsafe_sites,
-            // Filled in by the build once the graph is done; see `freshness`.
+            // Filled in by the build once the graph is done; see `freshness`
+            // and `targets`.
             files: Vec::new(),
+            discovered: Vec::new(),
+            targets: Vec::new(),
             stats: self.stats,
         }
     }

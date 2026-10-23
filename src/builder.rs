@@ -14,6 +14,7 @@
 //! 5. Derives.
 //! 6. Tests and unsafe code: syn finds them, and each is attached to its
 //!    item the same way impl headers are.
+//! 7. Targets: which Cargo target builds each file (see `targets`).
 //!
 //! rust-analyzer usually gives each item its own symbol, but not always. `main` in `build.rs` and `main` in
 //! `src/main.rs` share one symbol, and so do two structs with the same name
@@ -22,7 +23,7 @@
 //! [`Context::resolve`] decides which one a reference means.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use scip::types::symbol_information::Kind;
@@ -34,12 +35,18 @@ use crate::model::{
 };
 use crate::symbols::{self, ParsedSymbol, Shape};
 use crate::syntax::{self, FileFacts, NameAt};
+use crate::targets;
 
 /// A 0-based (line, character) position, as the index stores them.
 type Pos = (u32, u32);
 
-/// For one file: the symbols the index mentions on each 1-based line.
-type SymbolsByLine<'a> = HashMap<u32, Vec<&'a str>>;
+/// For one file: the symbols the index mentions on each 1-based line, each
+/// with the byte column it starts at ([`NO_COLUMN`] when the index counts
+/// columns some other way).
+type SymbolsByLine<'a> = HashMap<u32, Vec<(&'a str, u32)>>;
+
+/// A column that matches no name, for indexes that don't count bytes.
+const NO_COLUMN: u32 = u32::MAX;
 
 /// A start/end pair from the index. The end is exclusive.
 #[derive(Debug, Clone, Copy)]
@@ -230,12 +237,16 @@ pub fn build_graph(index: &Index, workspace: &Workspace, produced_by: String) ->
     let mut by_line: HashMap<&str, SymbolsByLine> = HashMap::new();
     for doc in &index.documents {
         let lines = by_line.entry(doc.relative_path.as_str()).or_default();
+        // syn's columns are converted to bytes; rust-analyzer writes bytes too.
+        let bytes = doc.position_encoding.enum_value_or_default()
+            == PositionEncoding::UTF8CodeUnitOffsetFromLineStart;
         for occ in &doc.occurrences {
             if let Some(span) = Span::from_range(&occ.range) {
+                let column = if bytes { span.start.1 } else { NO_COLUMN };
                 lines
                     .entry(span.start.0 + 1)
                     .or_default()
-                    .push(occ.symbol.as_str());
+                    .push((occ.symbol.as_str(), column));
             }
         }
     }
@@ -251,11 +262,20 @@ pub fn build_graph(index: &Index, workspace: &Workspace, produced_by: String) ->
             .unwrap_or_default();
         add_reference_edges(&mut graph, &ctx, doc, file_containers, &trait_method_impls);
     }
+    add_macro_body_calls(&mut graph, &ctx, &facts, &by_line);
     add_derive_edges(&mut graph, &ctx, &facts, &by_line);
     mark_tests(&mut graph, &ctx, &facts, &by_line);
     graph.unsafe_sites = find_unsafe_owners(&graph, &ctx, &facts, &by_line);
 
-    graph.finish(produced_by)
+    let indexed: HashSet<&str> = index
+        .documents
+        .iter()
+        .map(|d| d.relative_path.as_str())
+        .collect();
+    let targets = targets::map(workspace, &indexed, &facts);
+    let mut graph = graph.finish(produced_by);
+    graph.targets = targets;
+    graph
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +353,7 @@ fn crate_node(name: &str) -> Node {
         line: None,
         signature: None,
         test: false,
+        parameterized: false,
     }
 }
 
@@ -410,6 +431,7 @@ fn add_item_nodes(graph: &mut GraphBuilder, ctx: &mut Context) {
                 line: Some(def.line),
                 signature: (!signature.is_empty()).then(|| signature.to_string()),
                 test: false,
+                parameterized: false,
             });
             ctx.items.push(Item {
                 symbol: symbol.clone(),
@@ -424,6 +446,25 @@ fn add_item_nodes(graph: &mut GraphBuilder, ctx: &mut Context) {
 // Step 2: impl blocks
 // ---------------------------------------------------------------------------
 
+/// The symbols the index has on `at`'s line under `at`'s name, each with
+/// whether its occurrence starts at `at`'s column. Those come first: they are
+/// the occurrence syn saw, which matters when a line names one thing twice
+/// (`impl<T: Area> Area for W<T>`) or two things alike
+/// (`impl fmt::Write for W<dyn io::Write>`).
+fn symbols_named<'a>(on_line: Option<&SymbolsByLine<'a>>, at: &NameAt) -> Vec<(&'a str, bool)> {
+    let Some(on_line) = on_line.and_then(|lines| lines.get(&at.line)) else {
+        return Vec::new();
+    };
+    let mut named: Vec<(&str, bool)> = on_line
+        .iter()
+        .filter(|(symbol, _)| symbols::parse(symbol).is_some_and(|p| p.name == at.name))
+        .map(|&(symbol, column)| (symbol, column == at.column))
+        .collect();
+    // A stable sort, so the index's order holds within each group.
+    named.sort_by_key(|&(_, at_column)| !at_column);
+    named
+}
+
 /// The node a name on a given line refers to, according to the index.
 /// `want` filters by kind, so `Loader` the trait is not confused with a module.
 fn resolve_name_on_line(
@@ -434,13 +475,55 @@ fn resolve_name_on_line(
     at: &NameAt,
     want: fn(NodeKind) -> bool,
 ) -> Option<String> {
-    on_line?
-        .get(&at.line)?
-        .iter()
-        .filter(|symbol| symbols::parse(symbol).is_some_and(|p| p.name == at.name))
-        .filter_map(|symbol| ctx.resolve_node(graph, symbol, file, at.line))
+    symbols_named(on_line, at)
+        .into_iter()
+        .filter_map(|(symbol, _)| ctx.resolve_node(graph, symbol, file, at.line))
         .find(|(node, _)| want(node.kind))
         .map(|(node, _)| node.id.clone())
+}
+
+/// The node for a trait from outside the workspace named in an impl header,
+/// such as `fmt::Display` in `impl fmt::Display for Money`.
+///
+/// The index names the trait exactly, so `core::fmt::Write` and
+/// `std::io::Write` stay apart and the link is EXACT. When the line can't be
+/// matched to one symbol, the trait is known by its name only: SYNTAX.
+fn outside_trait(
+    graph: &mut GraphBuilder,
+    ctx: &Context,
+    on_line: Option<&SymbolsByLine>,
+    at: &NameAt,
+) -> (String, Confidence) {
+    // Type-shaped symbols (`Trait#`) that nothing in the workspace defines.
+    let outside: Vec<(&str, bool)> = symbols_named(on_line, at)
+        .into_iter()
+        .filter(|(symbol, _)| !ctx.definitions.contains_key(*symbol))
+        .filter(|(symbol, _)| symbols::parse(symbol).is_some_and(|p| p.shape == Shape::Type))
+        .collect();
+    let distinct: HashSet<&str> = outside.iter().map(|&(symbol, _)| symbol).collect();
+    let exact = match outside.first() {
+        Some(&(symbol, true)) => Some(symbol),
+        Some(&(symbol, false)) if distinct.len() == 1 => Some(symbol),
+        _ => None,
+    };
+    if let Some((symbol, parsed)) = exact.and_then(|s| Some((s, symbols::parse(s)?))) {
+        graph.add_node(Node {
+            id: symbol.to_string(),
+            name: parsed.name.clone(),
+            path: parsed.full_path(),
+            kind: NodeKind::ExternalTrait,
+            krate: parsed.package.clone(),
+            file: None,
+            line: None,
+            signature: None,
+            test: false,
+            parameterized: false,
+        });
+        return (symbol.to_string(), Confidence::Exact);
+    }
+    let id = format!("trait:{}", at.name);
+    graph.add_node(named_node(&id, &at.name, NodeKind::ExternalTrait));
+    (id, Confidence::Syntax)
 }
 
 fn resolve_impl_blocks(
@@ -465,15 +548,10 @@ fn resolve_impl_blocks(
             });
 
             if let (Some(ty), Some(trait_at)) = (&self_type, &block.trait_name) {
-                // A trait from outside the workspace (Display, Iterator...) has no
-                // symbol in the index, so we only know its name: SYNTAX confidence.
                 let (target, confidence) = match &workspace_trait {
                     Some(t) => (t.clone(), Confidence::Exact),
-                    None => {
-                        let id = format!("trait:{}", trait_at.name);
-                        graph.add_node(named_node(&id, &trait_at.name, NodeKind::ExternalTrait));
-                        (id, Confidence::Syntax)
-                    }
+                    // Display, Iterator, serde's Serialize...
+                    None => outside_trait(graph, ctx, on_line, trait_at),
                 };
                 graph.add_edge(edge(
                     ty,
@@ -509,6 +587,7 @@ fn named_node(id: &str, name: &str, kind: NodeKind) -> Node {
         line: None,
         signature: None,
         test: false,
+        parameterized: false,
     }
 }
 
@@ -617,7 +696,9 @@ fn add_containment(graph: &mut GraphBuilder, ctx: &Context, impls: &[ResolvedImp
 // Step 4: references
 // ---------------------------------------------------------------------------
 
-/// For each file, the functions and types defined there, with their full spans.
+/// For each file, the items that can hold a reference, with their full spans:
+/// functions, types, and consts and statics, whose initializers can call
+/// functions (`static CONFIG: LazyLock<Config> = LazyLock::new(load)`).
 fn containers_by_file<'c>(
     graph: &GraphBuilder,
     ctx: &'c Context,
@@ -627,9 +708,11 @@ fn containers_by_file<'c>(
         let Some(span) = item.def.span else {
             continue;
         };
-        let is_container = graph
-            .node(&item.def.node_id)
-            .is_some_and(|n| n.kind.is_callable() || n.kind.is_type_like());
+        let is_container = graph.node(&item.def.node_id).is_some_and(|n| {
+            n.kind.is_callable()
+                || n.kind.is_type_like()
+                || matches!(n.kind, NodeKind::Const | NodeKind::Static)
+        });
         if is_container {
             out.entry(item.def.file.as_str())
                 .or_default()
@@ -690,6 +773,26 @@ fn is_call(after: &str) -> bool {
     after.starts_with('(') || after.starts_with("::<")
 }
 
+/// The source text an occurrence covers, when it fits on one line.
+fn token_text<'s>(lines: &[&'s str], span: Span, encoding: PositionEncoding) -> Option<&'s str> {
+    if span.start.0 != span.end.0 {
+        return None;
+    }
+    let line = lines.get(span.start.0 as usize)?;
+    line.get(byte_index(line, span.start.1, encoding)..byte_index(line, span.end.1, encoding))
+}
+
+/// Whether an occurrence is an operator rather than a name: `+`, `+=`, `-`,
+/// `*`, `==`, `[`, or the `await` of `.await`. rust-analyzer links each to the
+/// trait method it calls, such as `<Money as Add>::add`.
+fn is_operator(text: &str) -> bool {
+    text == "await"
+        || text
+            .chars()
+            .next()
+            .is_some_and(|c| !(c.is_alphanumeric() || c == '_'))
+}
+
 fn add_reference_edges(
     graph: &mut GraphBuilder,
     ctx: &Context,
@@ -734,8 +837,10 @@ fn add_reference_edges(
         };
 
         let after = text_after(&lines, span.end, encoding);
+        // `a + b` calls `add` without naming it, and no `(` follows the `+`.
+        let operator = token_text(&lines, span, encoding).is_some_and(is_operator);
         let kind = match target_kind {
-            k if k.is_callable() && is_call(after) => EdgeKind::Calls,
+            k if k.is_callable() && (operator || is_call(after)) => EdgeKind::Calls,
             k if k.is_callable() => EdgeKind::References,
             NodeKind::Macro if after.starts_with('!') => EdgeKind::Calls,
             k if k.is_type_like() && from != target_id => EdgeKind::UsesType,
@@ -761,6 +866,99 @@ fn add_reference_edges(
                     Some(file),
                     Some(line),
                 ));
+            }
+        }
+    }
+}
+
+/// Links each `macro_rules!` macro to the functions its body calls.
+///
+/// The index has no occurrence for those calls: the body is a template, and
+/// where the macro is used there is no token for the call. So the path
+/// written in the body (`$crate::log::write_line`) is matched against the
+/// callables of the macro's own package, and linked only when exactly one
+/// matches. Read from the source, not resolved: SYNTAX.
+fn add_macro_body_calls(
+    graph: &mut GraphBuilder,
+    ctx: &Context,
+    facts: &HashMap<String, FileFacts>,
+    by_line: &HashMap<&str, SymbolsByLine>,
+) {
+    /// A function or method a call in a macro body may mean.
+    struct Callable<'a> {
+        package: &'a str,
+        /// Its path without generic arguments (`GlobBuilder::build` for
+        /// `GlobBuilder<'a>::build`), and for a trait impl's method also as
+        /// `Square::area` for `<Square as Area>::area`.
+        forms: Vec<String>,
+        id: &'a str,
+    }
+    // By the callable's own name, the last part of any path that calls it.
+    let mut callables: HashMap<&str, Vec<Callable>> = HashMap::new();
+    for item in &ctx.items {
+        let Some(node) = graph.node(&item.def.node_id) else {
+            continue;
+        };
+        if !node.kind.is_callable() {
+            continue;
+        }
+        let path = symbols::strip_generics(&node.path);
+        let mut forms = vec![path.clone()];
+        forms.extend(symbols::without_trait(&path));
+        callables
+            .entry(item.parsed.name.as_str())
+            .or_default()
+            .push(Callable {
+                package: item.parsed.package.as_str(),
+                forms,
+                id: item.def.node_id.as_str(),
+            });
+    }
+
+    for doc in &ctx.index.documents {
+        let file = doc.relative_path.as_str();
+        let Some(file_facts) = facts.get(file) else {
+            continue;
+        };
+        for body in &file_facts.macro_bodies {
+            let Some(macro_id) =
+                resolve_name_on_line(graph, ctx, by_line.get(file), file, &body.name, |k| {
+                    k == NodeKind::Macro
+                })
+            else {
+                continue;
+            };
+            let package = graph
+                .node(&macro_id)
+                .map(|n| n.krate.clone())
+                .unwrap_or_default();
+            for call in &body.calls {
+                let Some(same_name) = call.path.last().and_then(|n| callables.get(n.as_str()))
+                else {
+                    continue;
+                };
+                let written = call.path.join("::");
+                let suffix = format!("::{written}");
+                let matches: Vec<&str> = same_name
+                    .iter()
+                    .filter(|c| {
+                        c.package == package
+                            && c.forms
+                                .iter()
+                                .any(|f| *f == written || f.ends_with(&suffix))
+                    })
+                    .map(|c| c.id)
+                    .collect();
+                if let [target] = matches.as_slice() {
+                    graph.add_edge(edge(
+                        &macro_id,
+                        target,
+                        EdgeKind::Calls,
+                        Confidence::Syntax,
+                        Some(file),
+                        Some(call.line),
+                    ));
+                }
             }
         }
     }
@@ -829,11 +1027,12 @@ fn mark_tests(
                 ctx,
                 by_line.get(file),
                 file,
-                test,
+                &test.name,
                 NodeKind::is_callable,
             );
             if let Some(node) = found.and_then(|id| graph.node_mut(&id)) {
                 node.test = true;
+                node.parameterized = test.parameterized;
             }
         }
     }
@@ -933,6 +1132,30 @@ mod tests {
         assert!(!is_call(text_after(&lines, (1, 21), utf8))); // `parse)` is not a call
         assert!(is_call(text_after(&lines, (2, 13), utf8))); // `collect::<`
         assert!(text_after(&lines, (3, 9), utf8).starts_with('!')); // a macro call
+    }
+
+    #[test]
+    fn operators_are_told_apart_from_names() {
+        let lines = ["    a + b", "    let n = x.len();"];
+        let utf8 = PositionEncoding::UTF8CodeUnitOffsetFromLineStart;
+        let span = |line, start, end| Span {
+            start: (line, start),
+            end: (line, end),
+        };
+        assert_eq!(token_text(&lines, span(0, 6, 7), utf8), Some("+"));
+        assert_eq!(token_text(&lines, span(1, 14, 17), utf8), Some("len"));
+        // An occurrence over several lines, such as a whole file's module, has no single text.
+        let file = Span {
+            start: (0, 0),
+            end: (1, 0),
+        };
+        assert_eq!(token_text(&lines, file, utf8), None);
+        for operator in ["+", "+=", "-", "*", "==", "[", "?", "await"] {
+            assert!(is_operator(operator), "{operator}");
+        }
+        for name in ["len", "r#type", "_x", "Self"] {
+            assert!(!is_operator(name), "{name}");
+        }
     }
 
     #[test]

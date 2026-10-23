@@ -4,6 +4,13 @@ Setup: Rust 1.95.0, rust-analyzer 0.3.3057 with the standard library's source,
 Graphify 0.9.67 with `--code-only`. Run on 2026-09-25, and again on 2026-09-26
 after the changes for tests, unsafe code and `cfg(miri)`: the same numbers.
 
+Not run again since the 2026-10-23 changes (see `DECISIONS.md`): operators now
+count as calls, consts and statics own the calls in their initializers, and
+macro bodies add SYNTAX links. The call counts below will move a little. The
+scripts keep comparing like with like: `compare_graphify.py` counts resolved
+links from function to function, and `precision_sample.py` leaves SYNTAX links
+out.
+
 ## Checked by reading the code
 
 These checks don't rely on either tool: each sampled line was checked against
@@ -11,8 +18,13 @@ the source code.
 
 | Check | Sample | Result |
 | --- | --- | --- |
-| Precision: is each call link right? | 50 random call links (two draws of 25, seeds 20260925 and 424242) | 50 of 50 correct |
-| Recall: is each call found? | 150 random call sites from the source text (seed 11), found with a regex, not with either tool | All 91 calls into workspace functions found |
+| Precision: is each call link right? | 50 random call links (two draws of 25, seeds 20260925 and 424242) | 50 of 50 correct: at least 94% at 95% confidence |
+| Recall: is each call found? | 150 random call sites from the source text (seed 11), found with a regex, not with either tool | All 91 calls into workspace functions found: at least 96% at 95% confidence |
+
+The bounds are one-sided 95% intervals for no error in the sample:
+`0.05^(1/50) = 0.942` and `0.05^(1/91) = 0.968`. The recall sample only holds
+calls written as `name(...)`; calls Rust makes without naming them (`drop`,
+`from` behind `?`) are outside it.
 
 In the recall sample, the other 59 sites were calls into std or other crates
 (`push`, `as_bytes`, `Duration::default`), closures, or text that only looks

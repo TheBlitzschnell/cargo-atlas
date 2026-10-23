@@ -9,6 +9,7 @@
 // Each test file uses a different subset of these helpers.
 #![allow(dead_code)]
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
@@ -87,6 +88,20 @@ pub fn atlas_error(fixture_name: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// Says once per test binary that its end-to-end tests are skipped. They
+/// still report `ok`, so this goes straight to stderr: libtest hides what
+/// `eprintln!` prints in a test that passes.
+fn say_tests_are_skipped() {
+    static SAID: OnceLock<()> = OnceLock::new();
+    SAID.get_or_init(|| {
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: CARGO_ATLAS_SKIP_RA_TESTS is set, so the end-to-end tests in this \
+             binary pass without checking anything"
+        );
+    });
+}
+
 fn rust_analyzer_available() -> bool {
     let binary =
         std::env::var_os("CARGO_ATLAS_RUST_ANALYZER").unwrap_or_else(|| "rust-analyzer".into());
@@ -101,7 +116,7 @@ fn rust_analyzer_available() -> bool {
 pub fn built(fixture_name: &str) -> bool {
     static BUILT: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     if std::env::var_os("CARGO_ATLAS_SKIP_RA_TESTS").is_some() {
-        eprintln!("skipping: CARGO_ATLAS_SKIP_RA_TESTS is set");
+        say_tests_are_skipped();
         return false;
     }
     assert!(

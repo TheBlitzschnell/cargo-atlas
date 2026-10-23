@@ -10,7 +10,10 @@ import sys
 repo, n, seed = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 g = json.load(open(f"{repo}/.atlas/graph.json"))
 N = {x["id"]: x for x in g["nodes"]}
-sites = [(e, ln) for e in g["edges"] if e["kind"] == "calls" for ln in e["lines"]]
+# Resolved calls only: a SYNTAX call (written in a macro body, matched by path)
+# is a different kind of claim and would need a sample of its own.
+sites = [(e, ln) for e in g["edges"]
+         if e["kind"] == "calls" and e["confidence"] != "SYNTAX" for ln in e["lines"]]
 sources = {}
 
 

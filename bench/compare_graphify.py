@@ -21,7 +21,10 @@ a_name = {n["id"]: n["name"] for n in atlas["nodes"]}
 a_calls = set()      # EXACT calls
 a_any = set()        # calls or may_call (a candidate impl counts as agreement)
 for e in atlas["edges"]:
-    if e["kind"] in ("calls", "may_call") and e["from"] in a_loc and e["to"] in a_callable:
+    # Function to function, resolved: not a static's initializer or a macro body's
+    # SYNTAX link, which Graphify has no counterpart for.
+    if (e["kind"] in ("calls", "may_call") and e["confidence"] != "SYNTAX"
+            and e["from"] in a_callable and e["from"] in a_loc and e["to"] in a_callable):
         pair = (a_loc[e["from"]], a_loc[e["to"]])
         a_any.add(pair)
         if e["kind"] == "calls":

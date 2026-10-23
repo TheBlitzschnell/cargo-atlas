@@ -132,6 +132,28 @@ fn a_location_or_a_crate_path_picks_one_item() {
 }
 
 #[test]
+fn path_from_main_follows_the_calls() {
+    if !built(F) {
+        return;
+    }
+    // main -> run -> (dyn Loader) <CsvReader as Loader>::load -> CsvReader::parse.
+    // main also names CsvReader, which contains parse: shorter, but not a call.
+    let out = atlas(F, &["path", "main", "CsvReader::parse"]);
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        [
+            "Shortest chain of calls from main to CsvReader::parse: 3 link(s)",
+            "main",
+            "--calls--> run   src/main.rs:17",
+            "--may_call--> <CsvReader as Loader>::load   src/main.rs:10  (through the trait)",
+            "--calls--> CsvReader::parse   src/loader.rs:9",
+        ],
+        "{out}"
+    );
+}
+
+#[test]
 fn callers_of_a_struct_points_to_explain() {
     if !built(F) {
         return;

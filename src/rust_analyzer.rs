@@ -58,9 +58,14 @@ pub fn binary() -> PathBuf {
 
 /// The version string, e.g. `rust-analyzer 0.3.3057-standalone`, or an error
 /// explaining how to install it.
-pub fn version() -> Result<String> {
+///
+/// Runs in the workspace, like [`write_index`]: rustup's `rust-analyzer`
+/// picks its toolchain from the folder it runs in, which should be the
+/// workspace's `rust-toolchain.toml`, not wherever cargo-atlas was started.
+pub fn version(workspace_root: &Path) -> Result<String> {
     let output = Command::new(binary())
         .arg("--version")
+        .current_dir(workspace_root)
         .output()
         .with_context(missing_help)?;
     if !output.status.success() {
@@ -82,13 +87,20 @@ fn missing_help() -> String {
 /// setting defaults to `["debug_assertions", "miri"]`. That removes every item
 /// marked `#[cfg(not(miri))]`, which in tokio is 40 of its 153 test files. The
 /// graph should show a normal build, so `miri` goes and `debug_assertions` stays.
+///
+/// `targetDir: true` sends the `cargo check` that rust-analyzer runs for build
+/// scripts and proc macros to `target/rust-analyzer`. In the workspace's own
+/// `target/` it would hold Cargo's lock on that folder, so a `cargo test`
+/// started while the MCP server rebuilds in the background would wait for it.
 fn config_json(features: &Features) -> serde_json::Value {
     let features = if features.all {
         json!("all")
     } else {
         json!(features.listed)
     };
-    json!({ "cargo": { "cfgs": ["debug_assertions"], "features": features } })
+    json!({
+        "cargo": { "cfgs": ["debug_assertions"], "features": features, "targetDir": true }
+    })
 }
 
 /// Runs `rust-analyzer scip` on the workspace and writes the index to `out`.
@@ -106,6 +118,7 @@ pub fn write_index(workspace_root: &Path, out: &Path, features: &Features) -> Re
         command.env("RUST_SRC_PATH", path);
     }
     let output = command
+        .current_dir(workspace_root)
         .arg("scip")
         .arg(workspace_root)
         .arg("--output")
