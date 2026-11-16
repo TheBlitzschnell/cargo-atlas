@@ -26,6 +26,23 @@ Details and how to reproduce: [`bench/README.md`](bench/README.md). A CI job
 checks the ripgrep map against links read by hand every night, with the
 rust-analyzer release they were checked with and with the latest one.
 
+Claude Code's rust-analyzer-lsp plugin asks the same rust-analyzer, one
+position at a time ([`bench/LSP.md`](bench/LSP.md), on ripgrep):
+
+- Where calls are direct, both give the same callers and reach the same tests.
+- For 13 of 40 random functions, called only through a trait (`&dyn Flag`,
+  `S: Sink`), the plugin's call hierarchy shows no callers; `callers` lists
+  them as CANDIDATE. Operators, macro bodies and const initializers are
+  missing from it too.
+- Measured by running each test, for the 22 of those functions that tests
+  run: `tests` found every test that runs them in its own process, listing
+  about 3 tests for each one that does. Walking the call hierarchy finds half, or 99.8% when
+  the walk also asks about trait methods, at a median of 13 requests where
+  `tests` takes one. Neither finds tests written through macros (see Limits).
+
+The plugin is better for definitions, types, and code that is being edited;
+the two work together.
+
 ## Install
 
 ```sh
@@ -112,7 +129,13 @@ claude mcp add --transport stdio cargo-atlas -- cargo-atlas serve
 ```
 
 Add `--scope user` to have it in every project. In a folder that isn't a Cargo
-workspace, the tools say so and do nothing else.
+workspace, the tools say so and do nothing else. `--scope project` writes it
+to the repository's `.mcp.json`, which Claude Code's cloud sessions also
+start, where language server plugins don't run; the cloud environment then
+needs cargo-atlas and rust-analyzer installed (not tried yet).
+
+Use it next to the rust-analyzer-lsp plugin, not instead of it: see
+[`bench/LSP.md`](bench/LSP.md) for what each answers better.
 
 The tools are `callers`, `callees`, `impls`, `path`, `explain`, `search`,
 `tests`, `unsafe_code` and `refresh`. Each returns the same text as the
@@ -247,6 +270,11 @@ Every link carries a confidence label:
   reaching `Glob::from_str`. Calls Rust makes without naming them (`drop`,
   `from` behind `?`, `next` in a `for` loop, `fmt` in `format!`) aren't in the
   code either; for those methods `tests` falls back to the tests that use the type.
+- Through a trait, `tests` lists every test that may reach the call: on
+  ripgrep, about 4 for each one that runs the function. Tests reached
+  through calls alone aren't listed apart yet.
+- `callers` on a trait method lists the calls made through the trait. A call
+  on a concrete type resolves to that type's impl and is listed under it.
 - An operator is linked when rust-analyzer resolves it to an impl. It looks
   the impl up for the operand's type as written, so `ledger[0]` on a
   `&Ledger` resolves to `Index::index` in std, and isn't linked.

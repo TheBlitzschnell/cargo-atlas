@@ -11,6 +11,9 @@ run in the new setup, gives that run's counts and Graphify comparison again,
 so the differences below come from those changes, not from the newer
 rust-analyzer.
 
+How cargo-atlas compares with the rust-analyzer language server that Claude
+Code's LSP plugin runs, measured against tests that were run: `LSP.md`.
+
 ## Checked by reading the code
 
 These checks don't rely on either tool: each sampled line was checked against

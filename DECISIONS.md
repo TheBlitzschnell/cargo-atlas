@@ -3,6 +3,14 @@
 One entry per decision: the date, what was decided, why, and what was rejected.
 Newest first.
 
+## 2026-11-16: Next to the rust-analyzer LSP plugin, not instead of it
+- Measured on ripgrep (`bench/LSP.md`), with the same rust-analyzer on both sides, and with the tests that run each function found by running every test alone. For a function called directly, the plugin's call hierarchy gives the same callers as `callers`, and walked up to the tests, the same tests as `tests` reaches through calls alone.
+- What cargo-atlas adds: 13 of 40 random functions are called only through a trait and have no callers in the call hierarchy. Of the tests that run the 22 sampled functions that tests run, the walk finds half and `tests` all, in one call. Operators, macro bodies and const initializers are missing from the call hierarchy too. An agent that hops to trait methods gets 99.8% of the tests, at a median of 13 requests in 5 rounds.
+- What the plugin does better: it is current after every edit and needs no build; a trait method's callers include the calls that resolve to its impls (22 more for `Matcher::find_at`); it lists blanket impls.
+- So the README presents cargo-atlas as the plugin's companion for questions about the whole workspace.
+- Kept: CANDIDATE links in `tests`, which list about 4 tests for each one that runs the function. They bring half the tests that run a function (423 of 847); missing a test is worse than running extra ones. Next: list the tests reached through calls alone apart from the rest.
+- Rejected: answering `tests` by walking a running rust-analyzer, as tools that wrap a language server do. A walk took up to 213 requests on ripgrep, and the server holds 0.8 to 1.6 GB while it runs; the graph answers in under a millisecond from 25 MB.
+
 ## 2026-11-16: A nightly check of the ripgrep map against links read by hand
 - Why: `rust-analyzer scip` is not a stable interface, and the README's numbers come from one release. A new one can change what the map holds without a test failing: the fixtures are small, and the ripgrep numbers were checked by hand, once.
 - Now: `.github/workflows/drift.yml` maps ripgrep 15.1.0 every night with two rust-analyzers, the 2026-07-06 release the expected links were checked with and the latest. `bench/drift_check.py` compares each map with `bench/expected-ripgrep-15.1.0.toml`: ten counts, 14 links read against the code, and Graphify's two wrong links, which must stay out. If only the latest job fails, rust-analyzer changed; `bench/diff_graphs.py` lists every link that differs between the two jobs' graphs.
