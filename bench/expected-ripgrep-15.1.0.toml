@@ -1,0 +1,153 @@
+# What cargo-atlas's map of ripgrep 15.1.0 (commit af60c2d) must hold.
+# bench/drift_check.py compares a fresh map with this file, and
+# .github/workflows/drift.yml runs it every night.
+#
+# Every link below was read against the code on 2026-11-16, in a map built
+# with rust-analyzer 2026-07-06 (commit 7ae18ed) and Rust 1.97.0 with rust-src.
+# When the check fails: list what changed with bench/diff_graphs.py, read each
+# change against the code, then update this file.
+
+workspace = "ripgrep 15.1.0"
+checked = "2026-11-16"
+rust_analyzer = "2026-07-06"
+format_version = 4
+
+[counts]
+items = 4130               # every node
+links = 21504              # every edge
+exact_calls = 5947         # function to function, EXACT, one per pair: bench/README.md
+candidates = 4411          # may_call: impls a call through a trait may reach
+syntax_calls = 21          # calls in macro_rules! bodies, all 21 read against the code
+outside_trait_impls = 108  # impls of traits from std and other crates, EXACT
+name_only_traits = 0       # traits from outside the workspace known only by name
+tests = 429                # functions marked as tests
+unsafe_sites = 5
+targets = 19               # 9 lib, 4 test, 3 example, 1 bench, 1 bin, 1 build script
+
+# A plain call. Graphify linked it to DecompressionReader::new, a function
+# of the same name in the same file.
+[[link]]
+from = "<DecompressionMatcherBuilder as Default>::default @ crates/cli/src/decompress.rs:35"
+to = "DecompressionMatcherBuilder::new @ crates/cli/src/decompress.rs:42"
+kind = "calls"
+confidence = "EXACT"
+at = "crates/cli/src/decompress.rs:36"
+
+# `glob_builder.build()` on a GlobSetBuilder, a type from another crate.
+# Graphify linked it to DecompressionReaderBuilder::build in the same file.
+[[link]]
+from = "DecompressionMatcherBuilder::build @ crates/cli/src/decompress.rs:50"
+to = "GlobSetBuilder::build @ crates/globset/src/lib.rs:581"
+kind = "calls"
+confidence = "EXACT"
+at = "crates/cli/src/decompress.rs:65"
+
+# `self.line_buffer.fill(..)`: a method of the same name on another type.
+[[link]]
+from = "LineBufferReader<'b, R>::fill @ crates/searcher/src/line_buffer.rs:256"
+to = "LineBuffer::fill @ crates/searcher/src/line_buffer.rs:406"
+kind = "calls"
+confidence = "EXACT"
+at = "crates/searcher/src/line_buffer.rs:257"
+
+# The end of a chain of builder methods; the last hop of the
+# `tests GlobBuilder::build` example in bench/README.md.
+[[link]]
+from = "GitignoreBuilder::add_line @ crates/ignore/src/gitignore.rs:447"
+to = "GlobBuilder<'a>::build @ crates/globset/src/glob.rs:579"
+kind = "calls"
+confidence = "EXACT"
+at = "crates/ignore/src/gitignore.rs:520"
+
+# An operator: `*stats += search_result.stats().unwrap()` adds a &Stats.
+[[link]]
+from = "search @ crates/core/main.rs:107"
+to = "<Stats as AddAssign<&'a Stats>>::add_assign @ crates/printer/src/stats.rs:139"
+kind = "calls"
+confidence = "EXACT"
+at = "crates/core/main.rs:137"
+
+# A deref: `for t in &*self.tokens`.
+[[link]]
+from = "Glob::literal @ crates/globset/src/glob.rs:334"
+to = "<Tokens as Deref>::deref @ crates/globset/src/glob.rs:257"
+kind = "calls"
+confidence = "EXACT"
+at = "crates/globset/src/glob.rs:339"
+
+# A call in the initializer of a static declared inside a function.
+[[link]]
+from = "CHOICES @ crates/core/flags/defs.rs:3029"
+to = "hyperlink_aliases @ crates/printer/src/hyperlink/mod.rs:946"
+kind = "calls"
+confidence = "EXACT"
+at = "crates/core/flags/defs.rs:3030"
+
+# A static naming another one in its initializer: `CHOICES.iter()`.
+[[link]]
+from = "BORROWED @ crates/core/flags/defs.rs:3036"
+to = "CHOICES @ crates/core/flags/defs.rs:3029"
+kind = "references"
+confidence = "EXACT"
+at = "crates/core/flags/defs.rs:3037"
+
+# A call in a const's initializer.
+[[link]]
+from = "HYPERLINK_PATTERN_ALIASES @ crates/printer/src/hyperlink/aliases.rs:6"
+to = "alias @ crates/printer/src/hyperlink/aliases.rs:71"
+kind = "calls"
+confidence = "EXACT"
+at = "crates/printer/src/hyperlink/aliases.rs:7"
+
+# A call in a macro_rules! body: rust-analyzer records nothing there, so the
+# link is SYNTAX, matched by its path `crate::messages::set_errored`.
+# If rust-analyzer starts indexing macro bodies, this is where it shows.
+[[link]]
+from = "err_message @ crates/core/messages.rs:82"
+to = "set_errored @ crates/core/messages.rs:137"
+kind = "calls"
+confidence = "SYNTAX"
+at = "crates/core/messages.rs:84"
+
+# `self.shortest_match_at(..)` in a trait's default method: grep-regex's
+# matcher overrides that method, so it is one of the possible targets.
+[[link]]
+from = "Matcher::is_match_at @ crates/matcher/src/lib.rs:987"
+to = "<RegexMatcher as Matcher>::shortest_match_at @ crates/regex/src/matcher.rs:471"
+kind = "may_call"
+confidence = "CANDIDATE"
+at = "crates/matcher/src/lib.rs:992"
+
+# `impl std::fmt::Display for Glob`: a trait from std, by its exact symbol.
+[[link]]
+from = "Glob @ crates/globset/src/glob.rs:76"
+to = "Display @ rust-analyzer cargo core https://github.com/rust-lang/rust/library/core fmt/Display#"
+kind = "implements"
+confidence = "EXACT"
+at = "crates/globset/src/glob.rs:117"
+
+# `impl serde::Serialize for Stats`, behind `#[cfg(feature = "serde")]` on
+# line 150: a trait from a dependency.
+[[link]]
+from = "Stats @ crates/printer/src/stats.rs:13"
+to = "Serialize @ rust-analyzer cargo serde_core 1.0.228 ser/Serialize#"
+kind = "implements"
+confidence = "EXACT"
+at = "crates/printer/src/stats.rs:150"
+
+# `#[derive(Clone, Debug)]` on line 297.
+[[link]]
+from = "SearcherBuilder @ crates/searcher/src/searcher/mod.rs:298"
+to = "Clone @ derive:Clone"
+kind = "derives"
+confidence = "SYNTAX"
+at = "crates/searcher/src/searcher/mod.rs:298"
+
+# Graphify's two wrong links from bench/README.md: no link of any kind.
+[[absent]]
+from = "<DecompressionMatcherBuilder as Default>::default @ crates/cli/src/decompress.rs:35"
+to = "DecompressionReader::new @ crates/cli/src/decompress.rs:352"
+
+[[absent]]
+from = "DecompressionMatcherBuilder::build @ crates/cli/src/decompress.rs:50"
+to = "DecompressionReaderBuilder::build @ crates/cli/src/decompress.rs:221"

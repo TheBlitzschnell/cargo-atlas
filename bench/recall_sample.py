@@ -2,8 +2,9 @@
 
 Call sites are found with a regex, independent of both tools. A site counts only
 if its target is a function defined in the workspace; calls into std or other
-crates are set aside. Sites the graph misses are printed so they can be checked
-against the code.
+crates are set aside. Sites in `macro_rules!` bodies count like any other: the
+graph links calls there as SYNTAX. Sites the graph misses are printed so they
+can be checked against the code.
 """
 import json
 import os
@@ -30,9 +31,11 @@ KEYWORDS = {"if", "while", "for", "match", "return", "fn", "loop", "in", "let", 
 call_re = re.compile(r"(?<![A-Za-z0-9_!])([a-z_][a-z0-9_]*)\s*(?:::<[^()]*>)?\(")
 
 sites = []
+# Sorted, so the same seed draws the same sites on every machine: the order in
+# which a file system lists a folder differs between ext4, APFS and NTFS.
 for root, dirs, files in os.walk(repo):
-    dirs[:] = [d for d in dirs if d not in ("target", ".atlas", ".git", "graphify-out")]
-    for f in files:
+    dirs[:] = sorted(d for d in dirs if d not in ("target", ".atlas", ".git", "graphify-out"))
+    for f in sorted(files):
         if not f.endswith(".rs"):
             continue
         path = os.path.join(root, f)

@@ -1,0 +1,76 @@
+# Every night: map ripgrep 15.1.0 and check the map against links that were
+# read against the code (bench/expected-ripgrep-15.1.0.toml).
+#
+# Two jobs. One uses the rust-analyzer release those links were checked with,
+# so if it fails, cargo-atlas changed. The other uses the latest release, so if
+# only it fails, rust-analyzer changed what it reports. Both keep their graph;
+# bench/README.md says how to list the links that differ.
+#
+# GitHub turns off a public repository's scheduled workflows after 60 days
+# without activity; turn this one back on in the Actions tab.
+name: Drift
+
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ripgrep:
+    name: ripgrep 15.1.0, rust-analyzer ${{ matrix.ra }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The rust-analyzer and Rust the expected links were checked with.
+          - ra: "2026-07-06"
+            rust: "1.97.0"
+          # What someone who keeps both up to date has.
+          - ra: latest
+            rust: stable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: BurntSushi/ripgrep
+          ref: "15.1.0"
+          path: ripgrep
+      - name: Build cargo-atlas
+        run: cargo build --release --locked
+      - name: Install Rust ${{ matrix.rust }} with the standard library's source
+        run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component rust-src
+      - name: Install rust-analyzer ${{ matrix.ra }}
+        run: |
+          if [ "${{ matrix.ra }}" = latest ]; then
+            url=https://github.com/rust-lang/rust-analyzer/releases/latest/download
+          else
+            url=https://github.com/rust-lang/rust-analyzer/releases/download/${{ matrix.ra }}
+          fi
+          mkdir -p "$RUNNER_TEMP/ra"
+          curl --proto '=https' -sSfL "$url/rust-analyzer-x86_64-unknown-linux-gnu.gz" \
+            | gunzip > "$RUNNER_TEMP/ra/rust-analyzer"
+          chmod +x "$RUNNER_TEMP/ra/rust-analyzer"
+          "$RUNNER_TEMP/ra/rust-analyzer" --version
+          echo "CARGO_ATLAS_RUST_ANALYZER=$RUNNER_TEMP/ra/rust-analyzer" >> "$GITHUB_ENV"
+      - name: Map ripgrep
+        # Without this, rustup would take the toolchain from cargo-atlas's
+        # rust-toolchain.toml, one folder up.
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+        run: target/release/cargo-atlas build --dir ripgrep
+      - name: Check the map
+        run: python3 -I bench/drift_check.py ripgrep/.atlas/graph.json bench/expected-ripgrep-15.1.0.toml
+      - name: Keep the graph
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: graph-ra-${{ matrix.ra }}
+          path: ripgrep/.atlas/graph.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 30

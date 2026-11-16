@@ -19,10 +19,12 @@ the exact function; Graphify, which matches names, links none of them. On
 ripgrep 15.1.0:
 
 - 50 random call links, checked by reading the code: 50 correct. With no error in 50, at least 94% of links are right, at 95% confidence.
-- 150 random call sites taken from the source text: all 91 calls into a workspace function were found, so recall is at least 96%, at 95% confidence. The sample holds calls written as `name(...)`; calls Rust makes without naming them, such as `drop`, are outside it (see Limits).
-- cargo-atlas finds 5,948 function-to-function call links, Graphify 2,809, and 39% of Graphify's comparable links point at a different function than rust-analyzer resolved.
+- 150 random call sites taken from the source text: 73 of the 74 calls into a workspace function were found, so recall is at least 93%, at 95% confidence. The miss is a method call in a `macro_rules!` body. The sample holds calls written as `name(...)`; calls Rust makes without naming them, such as `drop`, are outside it (see Limits).
+- cargo-atlas finds 5,947 function-to-function call links, Graphify 2,809, and 39% of Graphify's comparable links point at a different function than rust-analyzer resolved.
 
-Details and how to reproduce: [`bench/README.md`](bench/README.md).
+Details and how to reproduce: [`bench/README.md`](bench/README.md). A CI job
+checks the ripgrep map against links read by hand every night, with the
+rust-analyzer release they were checked with and with the latest one.
 
 ## Install
 
@@ -233,10 +235,12 @@ Every link carries a confidence label:
   items on Linux, or a feature that isn't on. Unsafe code in such items is
   still listed, marked as not in the index.
 - A test or `unsafe` block inside a `macro_rules!` body isn't seen: the body
-  is a template, not code. A call written there has no occurrence in the
-  index either, so the macro is linked to the function its path names, as
-  SYNTAX, when exactly one function of the macro's package matches. Method
-  calls in a body (`x.f()`) aren't linked.
+  is a template, not code. That can be most of a workspace's tests: 715 of
+  ripgrep's 1,144 are written through such macros, so `tests` can't list
+  them. A call written there has no occurrence in the index either, so the
+  macro is linked to the function its path names, as SYNTAX, when exactly one
+  function of the macro's package matches. Method calls in a body (`x.f()`)
+  aren't linked.
 - `tests` follows calls in the code. A test that runs the built program as a
   subprocess, as ripgrep's integration tests do, calls nothing in the graph,
   and neither does a call made through std, such as `"..".parse::<Glob>()`
@@ -247,7 +251,8 @@ Every link carries a confidence label:
   the impl up for the operand's type as written, so `ledger[0]` on a
   `&Ledger` resolves to `Index::index` in std, and isn't linked.
 - `rust-analyzer scip` is not a stable interface. Tested with rust-analyzer
-  0.3.3057 and with a build of its 2026-07-06 release.
+  0.3.3057 and its 2026-07-06 release; the ripgrep check runs every night
+  with the latest release too.
 
 Decisions and their reasons are logged in [`DECISIONS.md`](DECISIONS.md).
 
@@ -263,7 +268,8 @@ starts `cargo atlas serve` and talks MCP to it, as Claude Code does, including
 an edit followed by `refresh`. Without rust-analyzer the tests fail with
 install instructions; set `CARGO_ATLAS_SKIP_RA_TESTS=1` to skip them on
 purpose, and they say that they checked nothing. CI runs fmt, clippy and the
-tests on every push.
+tests on every push, and the ripgrep check (`.github/workflows/drift.yml`)
+every night.
 
 ## License
 

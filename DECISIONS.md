@@ -3,6 +3,16 @@
 One entry per decision: the date, what was decided, why, and what was rejected.
 Newest first.
 
+## 2026-11-16: A nightly check of the ripgrep map against links read by hand
+- Why: `rust-analyzer scip` is not a stable interface, and the README's numbers come from one release. A new one can change what the map holds without a test failing: the fixtures are small, and the ripgrep numbers were checked by hand, once.
+- Now: `.github/workflows/drift.yml` maps ripgrep 15.1.0 every night with two rust-analyzers, the 2026-07-06 release the expected links were checked with and the latest. `bench/drift_check.py` compares each map with `bench/expected-ripgrep-15.1.0.toml`: ten counts, 14 links read against the code, and Graphify's two wrong links, which must stay out. If only the latest job fails, rust-analyzer changed; `bench/diff_graphs.py` lists every link that differs between the two jobs' graphs.
+- Any difference fails, with no tolerance on counts: a count that moves is a number in the README that moved, and reading a few changed links is cheaper than explaining drift later.
+- Rejected: a whole graph checked in as the baseline (8 MB for ripgrep); the pinned job's graph is the baseline, kept 30 days. Running it on every push: it takes minutes, the fixture tests cover cargo-atlas's own changes, and the pinned job catches what they miss by the next morning.
+
+## 2026-11-16: The recall sample walks folders in sorted order and counts macro bodies
+- Bug: `os.walk` lists a folder in the order the file system gives it, which differs between ext4, APFS and NTFS, so a seed drew different call sites on different machines. The 2026-09-25 sample can't be drawn again.
+- Now: folders and files are sorted. Sites in `macro_rules!` bodies count too: the 2026-09-25 run set them aside as templates, but since 2026-10-23 the map links calls there as SYNTAX, and counting its hits there while setting its misses aside would flatter it.
+
 ## 2026-10-23: `path` follows calls first
 - Bug: `path` searched every kind of link in both directions, so `path main CsvReader::parse` answered `main --uses_type--> CsvReader --contains--> CsvReader::parse`: a type mention and containment, not how `main` reaches `parse`, which is what the MCP tool promised.
 - Now: the shortest chain of calls (`calls`, `may_call`, `references`, and a last `uses_type` when the goal is a type) from the first item to the second; then the other way round; only then any link, with a first line saying which it found. A type or trait starts from its methods, as in `tests`.
