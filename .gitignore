@@ -1,3 +1,4 @@
 /target
 /tests/fixtures/*/target
 /tests/fixtures/*/.atlas
+.DS_Store
